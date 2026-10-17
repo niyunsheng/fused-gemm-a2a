@@ -1,0 +1,3 @@
+# Install CUDA-enabled PyTorch with Triton and NVSHMEM support first.
+nvidia-cutlass-dsl[cu13]>=4.5.0
+cuda-python>=13.0,<14
