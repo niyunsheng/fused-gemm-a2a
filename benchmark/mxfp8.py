@@ -25,6 +25,7 @@ def main():
     parser.add_argument('--graph-batch', type=int, default=2)
     parser.add_argument('--cuda-graphs', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--profile', action='store_true')
+    parser.add_argument('--precision-order', choices=('bf16-first', 'mxfp8-first'), default='bf16-first')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.profile and not args.cuda_graphs:
@@ -45,7 +46,8 @@ def main():
     gs = [torch.randn_like(o) for _ in range(segments)]
     dy = torch.randn_like(x)
     timings = {}
-    for precision in ('bf16', 'mxfp8'):
+    order = ('bf16', 'mxfp8') if args.precision_order == 'bf16-first' else ('mxfp8', 'bf16')
+    for precision in order:
         workspace = FusedGemmA2AWorkspace(h, args.heads, m, gate=args.gate, precision=precision)
         qs = qkv(x, workspace)
         y = proj(o, workspace)

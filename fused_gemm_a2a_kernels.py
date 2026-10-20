@@ -59,6 +59,15 @@ def validate_tile_n(mode, tile_n, output_width, peers, segment_width=0, num_segm
             raise ValueError('QKV push needs one N tile per head')
 
 
+def mxfp8_tile_n(mode, output_width, peers=1, num_segments=1):
+    """Use wider tiles only when they preserve peer and per-head boundaries."""
+    if mode == 'push':
+        if num_segments > 1:
+            return 128
+        output_width //= peers
+    return 256 if output_width % 256 == 0 else 128
+
+
 def tile_swizzle(grouped_clusters, requested):
     """Swizzle group size for the persistent tile scheduler. CUTLASS pads the grouped dimension to a
     multiple of the swizzle and marks the padding tiles valid; a local TMA epilogue clips them, but
@@ -462,8 +471,9 @@ class UlyssesGemm:
         self.num_acc_stage, self.num_ab_stage, self.num_c_stage = _compute_stages(
             tiled_mma, self.mma_tiler, self.a_dtype, self.b_dtype, self.c_dtype, self.smem_capacity, c_smem_layout)
         if self.mxfp8:
-            # Reserve TMEM for scales; N=128 leaves room for two accumulator stages.
-            self.num_acc_stage = 2
+            # Reserve TMEM for scales: N=256 needs one accumulator stage;
+            # N=128 keeps two stages for the interleaved QKV push.
+            self.num_acc_stage = 1 if self.mma_tiler[1] == 256 else 2
             a_one = utils.sm100.make_smem_layout_a(tiled_mma, self.mma_tiler, self.a_dtype, 1)
             b_one = utils.sm100.make_smem_layout_b(tiled_mma, self.mma_tiler, self.b_dtype, 1)
             sa_one = blockscaled_utils.make_smem_layout_sfa(tiled_mma, self.mma_tiler, 32, 1)
@@ -1146,9 +1156,10 @@ def _mx_quant_kernel(a: cute.Pointer, q: cute.Pointer, sf: cute.Pointer,
     quantized = cute.make_rmem_tensor((8,), cutlass.Float8E4M3FN)
     if const_expr(transpose):
         smem = utils.SmemAllocator()
-        layout = cute.make_composed_layout(cute.make_swizzle(3, 3, 3), 0,
-                                           cute.make_layout((32, 128), stride=(128, 1)))
-        tile = smem.allocate_tensor(cutlass.BFloat16, layout.outer, byte_alignment=128, swizzle=layout.inner)
+        # FP32 words with an odd row stride give each lane a different bank
+        # in both transpose directions. BF16 values convert exactly to FP32.
+        tile = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32, 128), stride=(129, 1)), byte_alignment=128)
+        transposed = cute.make_rmem_tensor((8,), cutlass.Float32)
         for step in range(4):
             r, c = rm * 32 + (tid % 4) * 8, ck * 128 + tid // 4 + step * 32
             fragment.fill(0)
@@ -1161,7 +1172,7 @@ def _mx_quant_kernel(a: cute.Pointer, q: cute.Pointer, sf: cute.Pointer,
                     if r + j < rows and c < k:
                         fragment[j] = a[Int64(r + j) * stride_row + Int64(c) * stride_k]
             for j in cutlass.range_constexpr(8):
-                tile[((tid % 4) * 8 + j, tid // 4 + step * 32)] = fragment[j]
+                tile[((tid % 4) * 8 + j, tid // 4 + step * 32)] = fragment[j].to(cutlass.Float32)
         cute.arch.sync_threads()
     row = rm * 32 + tid // 4
     for step in range(4):
@@ -1169,7 +1180,7 @@ def _mx_quant_kernel(a: cute.Pointer, q: cute.Pointer, sf: cute.Pointer,
         col = group * 32 + (tid % 4) * 8
         if const_expr(transpose):
             for j in cutlass.range_constexpr(8):
-                fragment[j] = tile[(tid // 4, step * 32 + (tid % 4) * 8 + j)]
+                transposed[j] = tile[(tid // 4, step * 32 + (tid % 4) * 8 + j)]
         else:
             fragment.fill(0)
             if row < rows and col + 8 <= k:
@@ -1180,7 +1191,10 @@ def _mx_quant_kernel(a: cute.Pointer, q: cute.Pointer, sf: cute.Pointer,
                 for j in cutlass.range_constexpr(8):
                     if row < rows and col + j < k:
                         fragment[j] = a[Int64(row) * stride_row + col + j]
-        values = fragment.load().to(cutlass.Float32)
+        if const_expr(transpose):
+            values = transposed.load()
+        else:
+            values = fragment.load().to(cutlass.Float32)
         peak = cute.math.absf(values).reduce(cute.ReductionOp.MAX, cutlass.Float32(0), 0)
         peak = cute.arch.warp_reduction_max(peak, threads_in_group=4)
         exponent = cutlass.Int32(0)
@@ -1297,9 +1311,10 @@ def mxfp8_wgrad(dy, x, out, *, accumulate=False):
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     key = ('wgrad', tuple(dq.shape), tuple(xq.shape), tuple(out.shape), out.dtype, out.device.index)
     if key not in _mx_compiled:
-        op = UlyssesGemm('local', 1, 0, 0, 1, 128, 128)
+        op = UlyssesGemm('local', 1, 0, 0, 1, 128, mxfp8_tile_n('local', out.shape[1]))
         op.mxfp8 = True
-        op.a_shape, op.b_shape, op.c_shape = tuple(dq.shape), tuple(xq.shape), tuple(out.shape)
+        # B's allocated rows include quantizer padding, not extra output columns.
+        op.a_shape, op.b_shape, op.c_shape = tuple(dq.shape), (out.shape[1], xq.shape[1]), tuple(out.shape)
         op.a_rows = dq.shape[0]
         clusters = utils.HardwareInfo().get_max_active_clusters(CLUSTER_MN[0] * CLUSTER_MN[1])
         _mx_compiled[key] = compile_mxfp8(op, *args, clusters, stream)
@@ -1316,19 +1331,43 @@ def _cute_copy_rows_kernel(inputs: tuple, outputs: tuple, rows_in: Int32, rows_o
                            head_dim: Constexpr, head_offset: Constexpr):
     tid, _, _ = cute.arch.thread_idx()
     block, rank, segment = cute.arch.block_idx()
-    for j in cutlass.range(8, unroll_full=True):
-        offset = block * 1024 + j * 128 + tid
-        if offset < rows_out * width:
-            value = cutlass.Float32(0)
-            for i in cutlass.range_constexpr(len(inputs)):
-                if segment == i:
-                    if offset < rows_in * width:
-                        value = inputs[i][rank * rows_in * width + offset].to(cutlass.Float32)
-                        if const_expr(has_bias):
-                            col = offset % width
-                            index = ((head_offset + col // head_dim) * len(inputs) + i) * head_dim + col % head_dim
-                            value += bias[index].to(cutlass.Float32)
-                    outputs[i][rank * rows_out * width + offset] = value.to(cutlass.BFloat16)
+    if const_expr(width % 8 == 0):
+        atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+        values = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+        biases = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+        for step in range(4):
+            offset = block * 4096 + (step * 128 + tid) * 8
+            if offset < rows_out * width:
+                for i in cutlass.range_constexpr(len(inputs)):
+                    if segment == i:
+                        values.fill(0)
+                        if offset < rows_in * width:
+                            src_offset = cute.assume(Int64(rank) * rows_in * width + offset, divby=8)
+                            src = cute.make_tensor(inputs[i] + src_offset, cute.make_layout((8,), stride=(1,)))
+                            cute.copy(atom, src, values)
+                            if const_expr(has_bias):
+                                col = offset % width
+                                index = ((head_offset + col // head_dim) * len(inputs) + i) * head_dim + col % head_dim
+                                bp = cute.make_tensor(bias + cute.assume(index, divby=8), cute.make_layout((8,), stride=(1,)))
+                                cute.copy(atom, bp, biases)
+                                values.store((values.load().to(cutlass.Float32) + biases.load().to(cutlass.Float32)).to(cutlass.BFloat16))
+                        dst_offset = cute.assume(Int64(rank) * rows_out * width + offset, divby=8)
+                        dst = cute.make_tensor(outputs[i] + dst_offset, cute.make_layout((8,), stride=(1,)))
+                        cute.copy(atom, values, dst)
+    else:
+        for j in cutlass.range(8, unroll_full=True):
+            offset = block * 1024 + j * 128 + tid
+            if offset < rows_out * width:
+                value = cutlass.Float32(0)
+                for i in cutlass.range_constexpr(len(inputs)):
+                    if segment == i:
+                        if offset < rows_in * width:
+                            value = inputs[i][rank * rows_in * width + offset].to(cutlass.Float32)
+                            if const_expr(has_bias):
+                                col = offset % width
+                                index = ((head_offset + col // head_dim) * len(inputs) + i) * head_dim + col % head_dim
+                                value += bias[index].to(cutlass.Float32)
+                        outputs[i][rank * rows_out * width + offset] = value.to(cutlass.BFloat16)
 
 
 @cute.jit
@@ -1337,7 +1376,7 @@ def _cute_copy_rows_launch(inputs: tuple, outputs: tuple, rows_in: Int32, rows_o
                            head_dim: Constexpr, head_offset: Constexpr, stream: cuda.CUstream):
     _cute_copy_rows_kernel(inputs, outputs, rows_in, rows_out, width, bias, has_bias,
                            head_dim, head_offset).launch(
-        grid=[cute.ceil_div(rows_out * width, 1024), peers, len(inputs)], block=[128, 1, 1], stream=stream)
+        grid=[cute.ceil_div(rows_out * width, 4096 if width % 8 == 0 else 1024), peers, len(inputs)], block=[128, 1, 1], stream=stream)
 
 
 def _cute_copy_rows(inputs, outputs, rows_in, rows_out, peers, width, bias, head_dim, head_offset):

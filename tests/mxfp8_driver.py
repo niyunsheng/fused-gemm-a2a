@@ -183,6 +183,28 @@ def main():
                         del param.main_grad
             if rank == 0:
                 print('PARITY', segments, bias_mode, m, flush=True)
+    # Quantizer row padding must not create extra output tiles. In particular,
+    # an extra N tile can alias a 128-column TMA output and overwrite it with
+    # zeros. Exercise both eager and repeated changed-input graph execution.
+    for width in (128, 384):
+        for tokens in (1, 33, 1153):
+            dy = torch.randn(tokens, width, device=device, dtype=torch.bfloat16)
+            x = torch.randn_like(dy)
+            out = torch.empty(width, width, device=device, dtype=torch.float32)
+            for _ in range(3):
+                mxfp8_wgrad(dy, x, out)
+            check(out, quantized(dy.T) @ quantized(x.T).T, f'local/{width}/{tokens}/eager')
+            if not args.skip_graphs:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    mxfp8_wgrad(dy, x, out)
+                for replay in range(2):
+                    dy.normal_()
+                    x.normal_()
+                    graph.replay()
+                    check(out, quantized(dy.T) @ quantized(x.T).T,
+                          f'local/{width}/{tokens}/graph{replay}')
+                graph.reset()
     dy = torch.randn(128, h, device=device, dtype=torch.bfloat16)
     out = torch.empty(h, h, device=device, dtype=torch.float32)
     compiled = mxfp8_wgrad(dy, dy, out)

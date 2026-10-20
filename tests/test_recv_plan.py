@@ -5,7 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fused_gemm_a2a_kernels import CTA_M, push_split, tile_swizzle, validate_peer_count, validate_tile_n  # noqa: E402
+from fused_gemm_a2a_kernels import (CTA_M, mxfp8_tile_n, push_split, tile_swizzle,
+                                  validate_peer_count, validate_tile_n)  # noqa: E402
 
 
 class RecvPlanTest(unittest.TestCase):
@@ -29,6 +30,20 @@ class RecvPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r'CP \* tile N'):
             validate_tile_n('push', 256, 4096, 32, 4096)
         validate_tile_n('push', 128, 4096, 32, 4096)
+
+    def test_mxfp8_tile_selection_preserves_supported_widths(self):
+        for peers in (1, 2, 4, 8, 16, 32):
+            for heads_per_peer in (1, 2, 3, 4):
+                hidden = peers * heads_per_peer * 128
+                for segments in (1, 3, 4):
+                    tile = mxfp8_tile_n('push', hidden * segments, peers, segments)
+                    validate_tile_n('push', tile, hidden * segments, peers, hidden, segments, 128)
+                tile = mxfp8_tile_n('recv', hidden, peers)
+                validate_tile_n('recv', tile, hidden, peers)
+                self.assertEqual(hidden % mxfp8_tile_n('local', hidden), 0)
+        self.assertEqual(mxfp8_tile_n('push', 4096, 16), 256)
+        self.assertEqual(mxfp8_tile_n('push', 4096, 32), 128)
+        self.assertEqual(mxfp8_tile_n('local', 384), 128)
 
     def test_output_tiles_must_cover_exact_width(self):
         for width in (4095, 4097):

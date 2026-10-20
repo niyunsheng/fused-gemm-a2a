@@ -189,21 +189,28 @@ CPU checks: `python -m unittest discover -s tests`.
 ### Experimental MXFP8 status
 
 The MXFP8 path uses CuTe DSL throughout its custom kernels. CP8 and CP16 each
-pass 660 independent quantized-reference comparisons, including backward,
+pass 678 independent quantized-reference comparisons, including backward,
 bias, FP32 gradient accumulation and changed-input/weight CUDA Graph replay.
-BF16 regression passes 480 comparisons; 20 repository unit tests pass.
+BF16 regression passes 480 comparisons; 21 repository unit tests pass.
 
 GB200 · PyTorch 26.04 · CUDA 13.2 · CUTLASS 4.6.2 · H4096 · 32 heads × 128 ·
 QKVG + output projections · bias enabled · CUDA Graphs.
 All pairs below are **forward / backward**; MFU is BF16-equivalent.
+Values sum the two projection-stage medians and average runs in both
+precision orders (seven trials per run).
 
-| CP | Tokens | BF16 ms | MXFP8 ms | MXFP8 TFLOPS/GPU | MXFP8 MFU |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 8 | 131,072 | 2.477 / 4.436 | 2.633 / 4.628 | 1043.9 / 1188.0 | 41.76% / 47.52% |
-| 8 | 119,296 | 2.614 / 4.192 | 2.458 / 4.318 | 1017.9 / 1158.9 | 40.72% / 46.35% |
-| 16 | 131,072 | 1.267 / 2.334 | 1.423 / 2.418 | 965.9 / 1137.0 | 38.63% / 45.48% |
-| 16 | 119,296 | 1.296 / 2.208 | 1.350 / 2.358 | 926.6 / 1061.2 | 37.06% / 42.45% |
+| CP | Tokens | BF16 ms | MXFP8 ms | Speedup | MXFP8 TFLOPS/GPU | MXFP8 MFU |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 131,072 | 2.575 / 4.727 | 2.218 / 4.252 | 1.16x / 1.11x | 1239.5 / 1292.8 | 49.58% / 51.71% |
+| 8 | 119,296 | 2.714 / 4.446 | 2.097 / 3.911 | 1.29x / 1.14x | 1192.9 / 1279.2 | 47.72% / 51.17% |
+| 16 | 131,072 | 1.297 / 2.449 | 1.201 / 2.171 | 1.08x / 1.13x | 1144.0 / 1265.8 | 45.76% / 50.63% |
+| 16 | 119,296 | 1.325 / 2.320 | 1.144 / 2.093 | 1.16x / 1.11x | 1093.8 / 1195.3 | 43.75% / 47.81% |
 
-MXFP8 does not yet consistently outperform BF16. Receive-side transport,
-quantization and owned-output copies remain optimization targets.
-DiT integration and training convergence remain separate work.
+NCU-guided tuning vectorizes owned-output copies, reduces shared-memory bank
+conflicts in transpose quantization, and uses N=256 for receive/local GEMMs.
+The combined projections win in both precision orders for every row above;
+output-projection forward alone still regresses. This is not a DiT training
+MFU or convergence result, and MXFP8 remains on the experimental branch.
+
+For the MXFP8 benchmark, use `--bias --warmup 10 --iterations 128 --trials 7
+--graph-batch 8`, then repeat with `--precision-order mxfp8-first`.

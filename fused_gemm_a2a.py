@@ -26,7 +26,7 @@ from fused_gemm_a2a_kernels import (
     PUSHER_STEADY_WARPS, PUSHER_WARPS, PUSH_SPLIT, SWIZZLE,
     UlyssesGemm, barrier, padded_rows, push_split, reduce_bias_grad, resize_rank_rows,
     tile_swizzle, validate_peer_count, validate_tile_n,
-    mxfp8_wgrad, mxfp8_quantize, compile_mxfp8,
+    mxfp8_wgrad, mxfp8_quantize, mxfp8_tile_n, compile_mxfp8,
 )
 
 __all__ = ['FusedGemmA2AWorkspace', 'FusedQKVProjection', 'FusedOutputProjection']
@@ -182,14 +182,20 @@ class _Comm:
         clusters = self.max_active_clusters
         aux = list(aux) + [aux[0]] * (4 - len(aux))      # the kernel always takes four peer arrays
         srcs = list(srcs) + [srcs[0]] * (4 - len(srcs))  # and four head-side sources
-        tile_n = 128 if scales else (MMA_N_RECV if mode == 'recv' else (MMA_N_OUT_PUSH if num_segments == 1 else MMA_N))
         output_width = b.shape[1] if b_is_kn else b.shape[0]
+        if scales:
+            # Quantization pads B's rows. Those rows are not output columns:
+            # scheduling them can alias a degenerate TMA C tile or cross a peer.
+            output_width = n_segment * num_segments if mode == 'push' else c.shape[1]
+        b_shape = (output_width, b.shape[1]) if scales else tuple(b.shape)
+        tile_n = (mxfp8_tile_n(mode, output_width, self.p, num_segments) if scales
+                  else (MMA_N_RECV if mode == 'recv' else (MMA_N_OUT_PUSH if num_segments == 1 else MMA_N)))
         projections = num_segments if mode == 'push' else num_in
         validate_tile_n(mode, tile_n, output_width, self.p, n_segment, projections, head_dim)
         if bias is not None and (mode != 'push' or tuple(bias.shape) != (output_width,)
                                  or bias.dtype != torch.bfloat16):
             raise ValueError('GEMM bias requires push mode and a BF16 vector of output-width entries')
-        key = (mode, a.shape, a_rows, b.shape, b_is_kn, c.shape, a.dtype, num_in, n_segment, num_segments,
+        key = (mode, a.shape, a_rows, b_shape, b_is_kn, c.shape, a.dtype, num_in, n_segment, num_segments,
                in_gemm_pushers, clusters, head_dim, tile_n, bias is not None, pad_recv, bool(scales))
         args = (_ptr(a), _ptr(b), _ptr(c), _ptr(b if bias is None else bias),
                 *(_ptr(x, 8) for x in aux), _ptr(counters, 8),
@@ -203,7 +209,7 @@ class _Comm:
             op.b_is_kn = b_is_kn
             op.has_bias = bias is not None
             op.num_in = num_in
-            op.a_shape, op.b_shape, op.c_shape = tuple(a.shape), tuple(b.shape), tuple(c.shape)
+            op.a_shape, op.b_shape, op.c_shape = tuple(a.shape), b_shape, tuple(c.shape)
             op.a_rows = a_rows
             if any(len(x) != self.p for x in aux) or (mode == 'recv' and counters.numel() != c.shape[0] // CTA_M):
                 raise ValueError('Peer pointer arrays must have P entries and counters one per row block')
