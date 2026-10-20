@@ -1,7 +1,7 @@
 """Independent quantized-math parity, workspace lifetime and graph replay.
 
-Reference: OCP block-scaled product as documented by Triton dot_scaled:
-https://triton-lang.org/main/python-api/generated/triton.language.dot_scaled.html
+Reference: OCP block-scaled product used by CUTLASS MXF8 GEMM:
+https://github.com/NVIDIA/cutlass/blob/v4.5.0/examples/python/CuTeDSL/cute/blackwell/kernel/blockscaled_gemm/dense_blockscaled_gemm_persistent.py
 Use E4M3, 32 reduction elements per E8M0 scale, ceiling scale selection.
 Backward requantizes each operand along the new reduction axis; it does not
 transpose an already quantized payload or differentiate quantization itself.
@@ -58,6 +58,13 @@ def main():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     torch.cuda.set_stream(stream)
+    # The MXFP8 path must not dispatch to the BF16-only Triton auxiliaries.
+    import fused_gemm_a2a_kernels as kernels
+    class ForbiddenTritonKernel:
+        def __getitem__(self, grid):
+            raise AssertionError('MXFP8 dispatched a Triton kernel')
+    for name in ('_copy_rank_rows', '_copy_biased_rank_rows', '_bias_grad_partial', '_bias_grad_finish'):
+        setattr(kernels, name, ForbiddenTritonKernel())
     p, rank = dist.get_world_size(), dist.get_rank()
     h, d = args.heads * 128, 128
     torch.manual_seed(123)
@@ -179,7 +186,7 @@ def main():
     dy = torch.randn(128, h, device=device, dtype=torch.bfloat16)
     out = torch.empty(h, h, device=device, dtype=torch.float32)
     compiled = mxfp8_wgrad(dy, dy, out)
-    ptx = compiled.asm['ptx']
+    ptx = compiled.__ptx__
     if rank == 0:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.with_suffix('.ptx').write_text(ptx)
@@ -196,4 +203,5 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    from torch.distributed.elastic.multiprocessing.errors import record
+    record(main)()

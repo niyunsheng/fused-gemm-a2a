@@ -88,14 +88,15 @@ def main():
     torch.cuda.synchronize()
     if runtime.rank == 0:
         from fused_gemm_a2a_kernels import _native_mxfp8_kernels
-        kernel_metadata = [dict(name=k.name, registers=k.n_regs, spills=k.n_spills,
-                                shared=k.metadata.shared) for k in _native_mxfp8_kernels]
+        kernel_metadata = [dict(native_block_scaled_mma=('tcgen05.mma' in k.__ptx__ and
+                                                       'block_scale' in k.__ptx__))
+                           for k in _native_mxfp8_kernels]
         source = Path(__file__).resolve().parents[1]
         hashes = {name: hashlib.sha256((source/name).read_bytes()).hexdigest()
                   for name in ('fused_gemm_a2a.py', 'fused_gemm_a2a_kernels.py')}
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(dict(config={**vars(args), 'output': str(args.output)},
-                                              source_sha256=hashes, timings=timings,
+                                              source_sha256=hashes, mxfp8_backend='cute', timings=timings,
                                               kernel_metadata=kernel_metadata,
                                               trials_us=runtime.timing_samples), indent=2)+'\n')
     dist.barrier()
@@ -103,4 +104,5 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    from torch.distributed.elastic.multiprocessing.errors import record
+    record(main)()

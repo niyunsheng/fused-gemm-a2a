@@ -26,7 +26,7 @@ from fused_gemm_a2a_kernels import (
     PUSHER_STEADY_WARPS, PUSHER_WARPS, PUSH_SPLIT, SWIZZLE,
     UlyssesGemm, barrier, padded_rows, push_split, reduce_bias_grad, resize_rank_rows,
     tile_swizzle, validate_peer_count, validate_tile_n,
-    mxfp8_push, mxfp8_recv, mxfp8_stage, mxfp8_wgrad, mxfp8_quantize,
+    mxfp8_wgrad, mxfp8_quantize, compile_mxfp8,
 )
 
 __all__ = ['FusedGemmA2AWorkspace', 'FusedQKVProjection', 'FusedOutputProjection']
@@ -40,7 +40,8 @@ if WGRAD_BACKEND == 'fused_accum':
     import fused_weight_gradient_mlp_cuda as _wgrad_accum
 
 _CUTE_DTYPES = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16, torch.float32: cutlass.Float32,
-                torch.int32: cutlass.Int32, torch.int64: cutlass.Int64}
+                torch.int32: cutlass.Int32, torch.int64: cutlass.Int64,
+                torch.float8_e4m3fn: cutlass.Float8E4M3FN, torch.uint8: cutlass.Float8E8M0FNU}
 
 
 def _ptr(t: torch.Tensor, align=16) -> cute.Pointer:
@@ -159,7 +160,7 @@ class _Comm:
         return push_split(a.shape[1], p, num_in, PUSH_SPLIT)
 
     def gemm(self, mode, a, b, b_is_kn, c, aux, counters, num_in, n_segment, num_segments, srcs=(0, 0, 0, 0),
-             a_rows=None, head_dim=0, bias=None, src_rows=None):
+             a_rows=None, head_dim=0, bias=None, src_rows=None, scales=(), mx_sources=()):
         """Run the Ulysses GEMM. a [M, K]; b [N, K] (b_is_kn=False) or [K, N] (True); see UlyssesGemm.
         Receive counters reset at the reuse boundary; each row waits for P * num_in * split arrivals.
         srcs are the head-side inputs distributed by the GEMM's own pusher warps.
@@ -181,7 +182,7 @@ class _Comm:
         clusters = self.max_active_clusters
         aux = list(aux) + [aux[0]] * (4 - len(aux))      # the kernel always takes four peer arrays
         srcs = list(srcs) + [srcs[0]] * (4 - len(srcs))  # and four head-side sources
-        tile_n = MMA_N_RECV if mode == 'recv' else (MMA_N_OUT_PUSH if num_segments == 1 else MMA_N)
+        tile_n = 128 if scales else (MMA_N_RECV if mode == 'recv' else (MMA_N_OUT_PUSH if num_segments == 1 else MMA_N))
         output_width = b.shape[1] if b_is_kn else b.shape[0]
         projections = num_segments if mode == 'push' else num_in
         validate_tile_n(mode, tile_n, output_width, self.p, n_segment, projections, head_dim)
@@ -189,12 +190,15 @@ class _Comm:
                                  or bias.dtype != torch.bfloat16):
             raise ValueError('GEMM bias requires push mode and a BF16 vector of output-width entries')
         key = (mode, a.shape, a_rows, b.shape, b_is_kn, c.shape, a.dtype, num_in, n_segment, num_segments,
-               in_gemm_pushers, clusters, head_dim, tile_n, bias is not None, pad_recv)
+               in_gemm_pushers, clusters, head_dim, tile_n, bias is not None, pad_recv, bool(scales))
         args = (_ptr(a), _ptr(b), _ptr(c), _ptr(b if bias is None else bias),
                 *(_ptr(x, 8) for x in aux), _ptr(counters, 8),
-                *(Int64(x) for x in srcs), Int32(src_rows))
+                *(Int64(x) for x in srcs), Int32(src_rows),
+                tuple(_ptr(x) for x in (scales or (b, b))),
+                tuple(Int64(x) for x in (mx_sources or (0,) * 8)))
         if key not in self.compiled:
             op = UlyssesGemm(mode, self.p, self.rank, n_segment, num_segments, head_dim, tile_n)
+            op.mxfp8 = bool(scales)
             op.pad_recv = pad_recv
             op.b_is_kn = b_is_kn
             op.has_bias = bias is not None
@@ -218,7 +222,8 @@ class _Comm:
             else:
                 op.pusher_warps = 0
                 op.threads_per_cta = 32 * 6
-            self.compiled[key] = cute.compile(op, *args, clusters, self.stream())
+            compile_gemm = compile_mxfp8 if scales else cute.compile
+            self.compiled[key] = compile_gemm(op, *args, clusters, self.stream())
         self.compiled[key](*args, self.stream())
 
     def recv_gemm(self, a, b, b_is_kn, c, peer_recv, peer_counters, counters, num_in, srcs,
@@ -278,7 +283,7 @@ def _accumulated(param):
     return dummy.detach()
 
 
-def _bias_grad(bias, dy_rows, accumulate=True):
+def _bias_grad(bias, dy_rows, accumulate=True, *, use_cute=False):
     """Reduce logical rows in FP32; optionally write main_grad directly.
 
     accumulate=False returns parameter-dtype dbias for autograd/DDP, matching
@@ -288,8 +293,8 @@ def _bias_grad(bias, dy_rows, accumulate=True):
         return None
     main_grad = getattr(bias, 'main_grad', None)
     if main_grad is None or not accumulate:
-        return reduce_bias_grad(dy_rows, torch.empty_like(bias))
-    reduce_bias_grad(dy_rows, main_grad, accumulate=True)
+        return reduce_bias_grad(dy_rows, torch.empty_like(bias), use_cute=use_cute)
+    reduce_bias_grad(dy_rows, main_grad, accumulate=True, use_cute=use_cute)
     return _accumulated(bias)
 
 
@@ -311,7 +316,7 @@ class _FusedQKV(torch.autograd.Function):
         outputs = resize_rank_rows(
             workspace.heads, comm.p, tokens, copy=True,
             bias=bias if module.apply_bias and not module.bias_in_gemm else None,
-            head_dim=module.head_dim, head_offset=comm.rank * module.num_heads // comm.p)
+            head_dim=module.head_dim, head_offset=comm.rank * module.num_heads // comm.p, use_cute=workspace.precision == 'mxfp8')
         return tuple(buf.view(-1, buf.shape[1] // module.head_dim, module.head_dim)
                      for buf in outputs)
 
@@ -333,7 +338,7 @@ class _FusedQKV(torch.autograd.Function):
         # the original parameter for main_grad and DDP metadata; the unpacked
         # weight above still supplies the saved numerical value for dgrad.
         dw = _weight_grad(module.weight, dy, x, workspace.precision)
-        db = _bias_grad(module.bias if ctx.has_bias else None, dy, module.accumulate_bias_grad)
+        db = _bias_grad(module.bias if ctx.has_bias else None, dy, module.accumulate_bias_grad, use_cute=workspace.precision == 'mxfp8')
         return dx[:tokens], dw, db, None, None
 
 
@@ -370,9 +375,9 @@ class _FusedOutput(torch.autograd.Function):
         workspace.run_push(dy, weight, True, 1)
         comm.barrier()
         dw = _weight_grad(module.weight, dy, o_seq, workspace.precision)  # Metadata belongs to the original Parameter.
-        db = _bias_grad(module.bias, dy, module.accumulate_bias_grad) if ctx.has_bias else None
+        db = _bias_grad(module.bias, dy, module.accumulate_bias_grad, use_cute=workspace.precision == 'mxfp8') if ctx.has_bias else None
         # Strip padding and own dO in one copy: other backwards may reuse the workspace.
-        do, = resize_rank_rows(workspace.heads, comm.p, tokens, copy=True)
+        do, = resize_rank_rows(workspace.heads, comm.p, tokens, copy=True, use_cute=workspace.precision == 'mxfp8')
         return do.view(-1, do.shape[1] // module.head_dim, module.head_dim), dw, db, None, None, None
 
 
@@ -382,7 +387,7 @@ class _ProjectionBuffers:
     def __init__(self, comm, capacity, hidden_size, head_dim, segments):
         self.comm, self.capacity, self.head_dim = comm, capacity, head_dim
         self.workspaces = {}
-        self.mx_heads = None
+        self.mx_recv = None
         self.heads, self.peer_heads = [], []
         for i in range(segments):
             key = ('dhead' if segments == 1 else 'head', i)
@@ -396,19 +401,11 @@ class _ProjectionBuffers:
         dist.barrier(comm.group)
 
     def init_mxfp8(self):
-        if self.mx_heads is not None:
+        if self.mx_recv is not None:
             return
-        self.mx_heads, self.mx_peers, self.mx_scales = [], [], []
-        self.mx_recv = (torch.empty_like(self.recv, dtype=torch.float8_e4m3fn),
-                        torch.empty((self.recv.shape[0], self.recv.shape[1] // 32),
-                                    device=self.recv.device, dtype=torch.uint8))
-        self.mx_ready = torch.empty(self.capacity // 128, device=self.recv.device, dtype=torch.int32)
-        for head in self.heads:
-            q, qp = self.comm.symmetric(tuple(head.shape), torch.float8_e4m3fn)
-            s, sp = self.comm.symmetric((head.shape[0], head.shape[1] // 32), torch.uint8)
-            self.mx_heads.append((q, s))
-            self.mx_peers.append(qp)
-            self.mx_scales.append(sp)
+        rows, k = self.recv.shape
+        self.mx_recv, self.peer_mx_recv = self.comm.symmetric((rows, k), torch.float8_e4m3fn)
+        self.mx_scale, self.peer_mx_scale = self.comm.symmetric((rows * k // 32,), torch.uint8)
 
 
 class _ProjectionWorkspace:
@@ -423,53 +420,48 @@ class _ProjectionWorkspace:
         self.counters, self.peer_counters = buffers.counters[:capacity // CTA_M], buffers.peer_counters
         self.epoch = buffers.epoch
         if precision == 'mxfp8':
-            self.mx_heads = [(q[:self.comm.p * capacity], s[:self.comm.p * capacity])
-                             for q, s in buffers.mx_heads]
-            self.mx_peers, self.mx_scales = buffers.mx_peers, buffers.mx_scales
-            self.mx_recv = tuple(t[:capacity] for t in buffers.mx_recv)
-            self.mx_ready = buffers.mx_ready[:capacity // 128]
+            self.mx_recv = buffers.mx_recv[:capacity]
+            self.mx_scale = buffers.mx_scale[:capacity * self.recv.shape[1] // 32]
+            self.peer_mx_recv, self.peer_mx_scale = buffers.peer_mx_recv, buffers.peer_mx_scale
 
     def run_push(self, a, weight, b_is_kn, segments, bias=None):
+        scales = ()
+        width = weight.shape[1] if b_is_kn else weight.shape[0]
         if self.precision == 'mxfp8':
-            mxfp8_push(a, weight, self.peer_heads, rank=self.comm.rank,
-                       capacity=self.capacity, head_dim=self.head_dim,
-                       segments=segments, b_is_kn=b_is_kn, bias=bias)
-        else:
-            width = weight.shape[1] if b_is_kn else weight.shape[0]
-            self.comm.gemm('push', a, weight, b_is_kn, self.heads[0], self.peer_heads,
-                           self.counters, 0, width // segments, segments,
-                           a_rows=self.capacity, head_dim=self.head_dim, bias=bias)
+            a, sa = mxfp8_quantize(a)
+            weight, sb = mxfp8_quantize(weight.T if b_is_kn else weight)
+            scales, b_is_kn = (sa, sb), False
+        self.comm.gemm('push', a, weight, b_is_kn, self.heads[0], self.peer_heads,
+                       self.counters, 0, width // segments, segments,
+                       a_rows=self.capacity, head_dim=self.head_dim, bias=bias, scales=scales)
 
     def begin_recv(self):
-        if self.precision == 'mxfp8':
-            self.comm.barrier()
-        else:
-            self.comm.barrier(bump=True, epoch=self.epoch, counters=self.counters)
+        self.comm.barrier(bump=True, epoch=self.epoch, counters=self.counters)
 
     def run_recv(self, inputs, weight, b_is_kn, out):
-        """Receive-side GEMM: `inputs` (head-side [T, C] tensors, one per segment) are pushed to the
-        peers while the GEMM consumes the receive buffer row block by row block."""
+        """Pusher warps publish BF16 saved values, MX payloads and scales before
+        releasing each row counter. TMA then consumes that completed row tile."""
         shape = inputs[0].shape
         if any(t.shape != shape for t in inputs):
             raise ValueError('All head-side inputs must have the same shape')
         if shape[0] % self.comm.p:
             raise ValueError('Head-side rows must divide evenly over CP ranks')
-        if self.precision == 'mxfp8':
-            mxfp8_stage(inputs, self.heads, self.comm.p, self.capacity)
-            for head, quantized in zip(self.heads, self.mx_heads):
-                mxfp8_quantize(head, quantized)
-            self.mx_ready.zero_()
-            self.comm.barrier()
-            mxfp8_recv(weight, out, self.recv, self.mx_recv, self.mx_ready,
-                       self.peer_heads, self.mx_peers, self.mx_scales, rank=self.comm.rank,
-                       capacity=self.capacity, tokens=shape[0] // self.comm.p,
-                       head_dim=self.head_dim, segments=len(inputs), b_is_kn=b_is_kn)
-            self.comm.barrier()  # All peer readers finish before the next workspace use.
-            return
         srcs = [t.data_ptr() for t in inputs]
-        self.comm.recv_gemm(self.recv, weight, b_is_kn, out, self.peer_recv, self.peer_counters, self.counters,
-                            len(inputs), srcs, self.head_dim,
-                            src_rows=shape[0] // self.comm.p)
+        if self.precision == 'mxfp8':
+            quantized = [mxfp8_quantize(t, k_multiple=128) for t in inputs]
+            weight, sb = mxfp8_quantize(weight.T if b_is_kn else weight)
+            qsrc = [q.data_ptr() for q, _ in quantized]
+            ssrc = [s.data_ptr() for _, s in quantized]
+            qsrc += [qsrc[0]] * (4 - len(qsrc))
+            ssrc += [ssrc[0]] * (4 - len(ssrc))
+            self.comm.gemm('recv', self.mx_recv, weight, False, out,
+                           [self.peer_recv, self.peer_counters, self.peer_mx_recv, self.peer_mx_scale],
+                           self.counters, len(inputs), 0, 1, srcs=srcs, head_dim=self.head_dim,
+                           src_rows=shape[0] // self.comm.p, scales=(self.mx_scale, sb),
+                           mx_sources=tuple(qsrc + ssrc))
+        else:
+            self.comm.recv_gemm(self.recv, weight, b_is_kn, out, self.peer_recv, self.peer_counters, self.counters,
+                               len(inputs), srcs, self.head_dim, src_rows=shape[0] // self.comm.p)
 
 @dataclass(frozen=True, eq=False)
 class FusedGemmA2AWorkspace:

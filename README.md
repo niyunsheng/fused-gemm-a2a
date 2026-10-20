@@ -51,7 +51,7 @@ Import from the checkout, or copy these two files into your project.
 | File | Purpose |
 | --- | --- |
 | `fused_gemm_a2a.py` | Public workspace, projections and autograd |
-| `fused_gemm_a2a_kernels.py` | CuTe GEMMs, peer transport, Triton copies/reductions and tile geometry |
+| `fused_gemm_a2a_kernels.py` | CuTe GEMMs, peer transport, MXFP8 conversion and auxiliary kernels |
 
 ## API
 
@@ -116,9 +116,11 @@ The path requires `D=128` and supports optional bias and FP32 `main_grad`
 accumulation. TE quantized Parameter subclasses are not accepted yet.
 Quantization runs on every invocation, including CUDA Graph replay after
 weight updates. QKV/output-gradient tiles are sent as BF16. Receive GEMMs
-elect one producer CTA per row tile to gather peer payloads/scales and save
-the BF16 operand for backward; other column CTAs reuse those local rows.
-This prototype uses a different pipeline from the BF16 receive-pusher path.
+use the same CuTe persistent GEMM and receive-pusher pipeline as BF16.
+Pusher warps transfer payloads, scales and the BF16 operand saved for backward,
+then publish row completion counters. TMA waits for complete rows before MMA.
+MXFP8 quantization, row copies and bias reductions also use CuTe DSL.
+The BF16 path retains its existing Triton copies and reductions.
 
 ```bash
 torchrun --standalone --nproc-per-node=4 tests/mxfp8_driver.py \
@@ -186,32 +188,22 @@ CPU checks: `python -m unittest discover -s tests`.
 
 ### Experimental MXFP8 status
 
-The MXFP8 path is numerically validated but currently **slower than BF16**.
-It remains a development implementation, not a throughput replacement.
+The MXFP8 path uses CuTe DSL throughout its custom kernels. CP8 and CP16 each
+pass 660 independent quantized-reference comparisons, including backward,
+bias, FP32 gradient accumulation and changed-input/weight CUDA Graph replay.
+BF16 regression passes 480 comparisons; 20 repository unit tests pass.
 
-GB200 NVLink, 131,072 tokens, 32 heads × 128, QKVG + output projections,
-bias enabled, CUDA Graphs. Same-job comparison; times are forward / backward.
+GB200 · PyTorch 26.04 · CUDA 13.2 · CUTLASS 4.6.2 · H4096 · 32 heads × 128 ·
+QKVG + output projections · bias enabled · CUDA Graphs.
+All pairs below are **forward / backward**; MFU is BF16-equivalent.
 
-| CP | BF16 (ms) | MXFP8 (ms) |
-| ---: | ---: | ---: |
-| 8 | 2.980 / 5.135 | 3.835 / 10.675 |
-| 16 | 1.263 / 2.301 | 2.196 / 6.501 |
+| CP | Tokens | BF16 ms | MXFP8 ms | MXFP8 TFLOPS/GPU | MXFP8 MFU |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 131,072 | 2.477 / 4.436 | 2.633 / 4.628 | 1043.9 / 1188.0 | 41.76% / 47.52% |
+| 8 | 119,296 | 2.614 / 4.192 | 2.458 / 4.318 | 1017.9 / 1158.9 | 40.72% / 46.35% |
+| 16 | 131,072 | 1.267 / 2.334 | 1.423 / 2.418 | 965.9 / 1137.0 | 38.63% / 45.48% |
+| 16 | 119,296 | 1.296 / 2.208 | 1.350 / 2.358 | 926.6 / 1061.2 | 37.06% / 42.45% |
 
-CP8 and CP16 each pass 660 independent quantized-reference checks, including
-changed-weight graph replay and FP32 gradient accumulation. Maximum relative
-L2 error is below 2.84e-4. Native block-scaled MMA is checked for every GEMM
-specialization. DiT integration and end-to-end training validation remain
-separate work.
-
-## License
-
-Original code is released under [MIT](LICENSE). This project builds on:
-
-- [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass): Blackwell GEMM examples,
-  [BSD-3-Clause](https://github.com/NVIDIA/cutlass/blob/main/LICENSE.txt).
-- [ByteDance VeOmni](https://github.com/ByteDance-Seed/VeOmni): async Ulysses
-  benchmark reference, [Apache-2.0](https://github.com/ByteDance-Seed/VeOmni/blob/main/LICENSE).
-
-The CuTe DSL runtime has separate
-[NVIDIA license terms](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html).
-Notices for adapted source are in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
+MXFP8 does not yet consistently outperform BF16. Receive-side transport,
+quantization and owned-output copies remain optimization targets.
+DiT integration and training convergence remain separate work.
