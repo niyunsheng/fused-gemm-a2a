@@ -1006,3 +1006,244 @@ def resize_rank_rows(tensors, peers, rows, *, copy=False, bias=None,
         _copy_biased_rank_rows[grid](tensors, outputs, input_rows, rows, bias, width,
                                    tile_rows, columns, head_dim, head_offset, num_warps=4)
     return outputs
+
+
+# Experimental MXFP8 path; independently quantize each GEMM's reduction axis.
+@triton.jit
+def _mx_operand(x, R: tl.constexpr, K: tl.constexpr):
+    groups = x.to(tl.float32).reshape(R, K // 32, 32)
+    amax = tl.max(tl.abs(groups), 2)
+    exponent = tl.ceil(tl.log2(tl.maximum(amax, 2.0 ** -120) / 448.0))
+    exponent = tl.where(amax == 0, 0.0, tl.minimum(tl.maximum(exponent, -126.0), 127.0))
+    scaled = groups * tl.exp2(-exponent)[:, :, None]
+    payload = tl.minimum(tl.maximum(scaled, -448.0), 448.0).to(tl.float8e4nv)
+    return payload.reshape(R, K), (exponent + 127).to(tl.uint8)
+
+
+@triton.jit
+def _mx_quant(A, Q, S, ROWS: tl.constexpr, K: tl.constexpr, KP: tl.constexpr,
+              SR: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr = 32, BK: tl.constexpr = 128):
+    r = tl.program_id(0) * BM + tl.arange(0, BM)
+    k = tl.program_id(1) * BK + tl.arange(0, BK)
+    x = tl.load(A + r[:, None] * SR + k[None, :] * SK,
+                (r[:, None] < ROWS) & (k[None, :] < K), 0)
+    q, s = _mx_operand(x, BM, BK)
+    tl.store(Q + r[:, None] * KP + k[None, :], q, r[:, None] < ROWS)
+    sk = tl.program_id(1) * (BK // 32) + tl.arange(0, BK // 32)
+    tl.store(S + r[:, None] * (KP // 32) + sk[None, :], s, r[:, None] < ROWS)
+
+
+@triton.jit
+def _mx_tile(M, N: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, GROUP_M: tl.constexpr = 8):
+    # Keep a small row group resident while traversing weight-column tiles.
+    pid = tl.program_id(0)
+    nm, nn = tl.cdiv(M, BM), tl.cdiv(N, BN)
+    first = pid // (GROUP_M * nn) * GROUP_M
+    group = tl.minimum(nm - first, GROUP_M)
+    within = pid % (GROUP_M * nn)
+    return first + within % group, within // group
+
+
+@triton.jit
+def _mx_push(A, AS, B, BS, Bias, Peer0, Peer1, Peer2, Peer3,
+             M, N: tl.constexpr, K: tl.constexpr, CAP: tl.constexpr,
+             P: tl.constexpr, RANK: tl.constexpr, D: tl.constexpr,
+             SEGMENTS: tl.constexpr, HAS_BIAS: tl.constexpr,
+             BM: tl.constexpr = 128, BN: tl.constexpr = 128, BK: tl.constexpr = 128):
+    pm, pn = _mx_tile(M, N, BM, BN)
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for start in range(tl.cdiv(K, BK)):
+        k = start * BK + rk
+        aq = tl.load(A + rm[:, None] * K + k[None, :], rm[:, None] < M, 0.0)
+        bq = tl.load(B + rn[:, None] * K + k[None, :], rn[:, None] < N, 0.0)
+        ks = start * (BK // 32) + tl.arange(0, BK // 32)
+        sa = tl.load(AS + rm[:, None] * (K // 32) + ks[None, :], rm[:, None] < M, 127)
+        sb = tl.load(BS + rn[:, None] * (K // 32) + ks[None, :], rn[:, None] < N, 127)
+        acc = tl.dot_scaled(aq, sa, 'e4m3', bq.T, sb, 'e4m3', acc)
+    if HAS_BIAS:
+        acc += tl.load(Bias + rn, rn < N, 0)[None, :]
+    # A tile stays within a single head/segment and therefore one destination.
+    n0 = pn * BN
+    width = N // SEGMENTS // P
+    head = n0 // (SEGMENTS * D)
+    peer = head // (width // D)
+    segment = n0 // D % SEGMENTS
+    col = (rn // (SEGMENTS * D) % (width // D)) * D + rn % D
+    if SEGMENTS == 1:
+        peer = n0 // width
+        col = rn % width
+    address = tl.load(Peer0 + peer)
+    if SEGMENTS > 1:
+        if segment == 1:
+            address = tl.load(Peer1 + peer)
+        if segment == 2:
+            address = tl.load(Peer2 + peer)
+        if SEGMENTS == 4:
+            if segment == 3:
+                address = tl.load(Peer3 + peer)
+    out = address.to(tl.pointer_type(tl.bfloat16))
+    tl.store(out + (RANK * CAP + rm[:, None]) * width + col[None, :],
+             acc.to(tl.bfloat16), (rm[:, None] < M) & (rn[None, :] < N))
+
+
+@triton.jit
+def _mx_publish_tile(A, AS, Saved, Ready, Peers, Payloads, Scales,
+                     M, K: tl.constexpr, CAP: tl.constexpr, P: tl.constexpr,
+                     RANK: tl.constexpr, D: tl.constexpr, SEGMENTS: tl.constexpr,
+                     pm, BM: tl.constexpr, BK: tl.constexpr):
+    # The first *running* CTA elects itself as producer. No consumer waits for
+    # a CTA that has not yet been scheduled, even on a fully occupied GPU.
+    owner = tl.atomic_cas(Ready + pm, 0, 1, sem="acquire", scope="gpu") == 0
+    if owner:
+        for row_chunk in range(BM // 32):
+            rm = pm * BM + row_chunk * 32 + tl.arange(0, 32)
+            rk = tl.arange(0, BK)
+            ks = tl.arange(0, BK // 32)
+            width = K // P // SEGMENTS
+            for start in range(tl.cdiv(K, BK)):
+                k0 = ((start + RANK * (K // P // BK)) % (K // BK)) * BK
+                k = k0 + rk
+                peer = k0 // (width * SEGMENTS)
+                segment = k0 // D % SEGMENTS
+                col = (k // (SEGMENTS * D) % (width // D)) * D + k % D
+                scol = (k0 // (SEGMENTS * D) % (width // D)) * (D // 32) + k0 % D // 32 + ks
+                if SEGMENTS == 1:
+                    col = k % width
+                    scol = k0 % width // 32 + ks
+                address = tl.full((), 0, tl.int64)
+                qa = tl.full((), 0, tl.int64)
+                ss = tl.full((), 0, tl.int64)
+                for i in tl.static_range(SEGMENTS):
+                    if segment == i:
+                        address = tl.load(Peers[i] + peer)
+                        qa = tl.load(Payloads[i] + peer)
+                        ss = tl.load(Scales[i] + peer)
+                offsets = (RANK * CAP + rm[:, None]) * width + col[None, :]
+                aq = tl.load(qa.to(tl.pointer_type(tl.float8e4nv)) + offsets, rm[:, None] < M, 0.0)
+                av = tl.load(address.to(tl.pointer_type(tl.bfloat16)) + offsets, rm[:, None] < M, 0)
+                sa = tl.load(ss.to(tl.pointer_type(tl.uint8)) +
+                             (RANK * CAP + rm[:, None]) * (width // 32) + scol[None, :], rm[:, None] < M, 127)
+                local = rm[:, None] * K + k[None, :]
+                tl.store(A + local, aq, rm[:, None] < M)
+                tl.store(Saved + local, av, rm[:, None] < M)
+                tl.store(AS + rm[:, None] * (K // 32) + (k0 // 32 + ks)[None, :], sa, rm[:, None] < M)
+        tl.debug_barrier()
+        tl.atomic_xchg(Ready + pm, 2, sem="release", scope="gpu")
+    else:
+        while tl.atomic_add(Ready + pm, 0, sem="acquire", scope="gpu") != 2:
+            pass
+
+
+@triton.jit
+def _mx_recv(B, BS, C, Saved, A, AS, Ready, Peers, Payloads, Scales,
+             M, N: tl.constexpr, K: tl.constexpr, CAP: tl.constexpr,
+             P: tl.constexpr, RANK: tl.constexpr, D: tl.constexpr,
+             SEGMENTS: tl.constexpr,
+             BM: tl.constexpr = 128, BN: tl.constexpr = 128, BK: tl.constexpr = 128):
+    pm, pn = _mx_tile(M, N, BM, BN, 128)
+    _mx_publish_tile(A, AS, Saved, Ready, Peers, Payloads, Scales,
+                     M, K, CAP, P, RANK, D, SEGMENTS, pm, BM, BK)
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for start in range(tl.cdiv(K, BK)):
+        k = start * BK + rk
+        ks = start * (BK // 32) + tl.arange(0, BK // 32)
+        aq = tl.load(A + rm[:, None] * K + k[None, :], rm[:, None] < M, 0.0, cache_modifier=".cg")
+        sa = tl.load(AS + rm[:, None] * (K // 32) + ks[None, :], rm[:, None] < M, 127, cache_modifier=".cg")
+        bq = tl.load(B + rn[:, None] * K + k[None, :], rn[:, None] < N, 0.0)
+        sb = tl.load(BS + rn[:, None] * (K // 32) + ks[None, :], rn[:, None] < N, 127)
+        acc = tl.dot_scaled(aq, sa, 'e4m3', bq.T, sb, 'e4m3', acc)
+    tl.store(C + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16),
+             (rm[:, None] < M) & (rn[None, :] < N))
+
+
+@triton.jit
+def _mx_wgrad(DY, DS, X, XS, DW, T: tl.constexpr, N: tl.constexpr, H: tl.constexpr,
+              ACCUMULATE: tl.constexpr,
+              BM: tl.constexpr = 128, BN: tl.constexpr = 128, BK: tl.constexpr = 128):
+    pm, pn = _mx_tile(N, H, BM, BN)
+    rn = pm * BM + tl.arange(0, BM)
+    rh = pn * BN + tl.arange(0, BN)
+    rt = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for start in range(tl.cdiv(T, BK)):
+        t = start * BK + rt
+        aq = tl.load(DY + rn[:, None] * T + t[None, :], rn[:, None] < N, 0.0)
+        bq = tl.load(X + rh[:, None] * T + t[None, :], rh[:, None] < H, 0.0)
+        ts = start * (BK // 32) + tl.arange(0, BK // 32)
+        sa = tl.load(DS + rn[:, None] * (T // 32) + ts[None, :], rn[:, None] < N, 127)
+        sb = tl.load(XS + rh[:, None] * (T // 32) + ts[None, :], rh[:, None] < H, 127)
+        acc = tl.dot_scaled(aq, sa, 'e4m3', bq.T, sb, 'e4m3', acc)
+    offsets = rn[:, None] * H + rh[None, :]
+    mask = (rn[:, None] < N) & (rh[None, :] < H)
+    if ACCUMULATE:
+        acc += tl.load(DW + offsets, mask, 0)
+    tl.store(DW + offsets, acc, mask)
+
+
+_native_mxfp8_kernels = set()
+
+
+def _require_native_mxfp8(kernel):
+    # dot_scaled can silently decompose unsupported tiles into ordinary GEMMs.
+    # Validate each compiled specialization once, before accepting its results.
+    if kernel not in _native_mxfp8_kernels:
+        ptx = kernel.asm['ptx']
+        if 'tcgen05.mma' not in ptx or 'block_scale' not in ptx:
+            raise RuntimeError('MXFP8 requires native SM100 block-scaled MMA; check Triton and tile shapes')
+        _native_mxfp8_kernels.add(kernel)
+    return kernel
+
+
+def mxfp8_quantize(a, out=None):
+    rows, k = a.shape
+    kp = triton.cdiv(k, 128) * 128
+    if out is None:
+        out = (torch.empty((rows, kp), device=a.device, dtype=torch.float8_e4m3fn),
+               torch.empty((rows, kp // 32), device=a.device, dtype=torch.uint8))
+    _mx_quant[(triton.cdiv(rows, 32), kp // 128)](
+        a, *out, rows, k, kp, *a.stride(), num_warps=4)
+    return out
+
+
+def mxfp8_push(a, b, peers, *, rank, capacity, head_dim, segments, b_is_kn=False, bias=None):
+    n = b.shape[1] if b_is_kn else b.shape[0]
+    ptrs = list(peers) + [peers[0]] * (4 - len(peers))
+    aq, sa = mxfp8_quantize(a)
+    bq, sb = mxfp8_quantize(b.T if b_is_kn else b)
+    bm = 128  # SM100 block-scaled MMA needs a 128-row tile, even for short inputs.
+    kernel = _mx_push[(triton.cdiv(a.shape[0], bm) * triton.cdiv(n, 128),)](
+        aq, sa, bq, sb, b if bias is None else bias, *ptrs, a.shape[0], n, aq.shape[1], capacity,
+        len(peers[0]), rank, head_dim, segments, bias is not None, BM=bm, num_warps=4)
+    return _require_native_mxfp8(kernel)
+
+
+def mxfp8_recv(b, out, saved, recv_quantized, ready, peers, payloads, scales, *, rank, capacity, tokens, head_dim, segments, b_is_kn=False):
+    n = b.shape[1] if b_is_kn else b.shape[0]
+    k = b.shape[0] if b_is_kn else b.shape[1]
+    bq, sb = mxfp8_quantize(b.T if b_is_kn else b)
+    bm = 128
+    kernel = _mx_recv[(triton.cdiv(tokens, bm) * triton.cdiv(n, 128),)](
+        bq, sb, out, saved, *recv_quantized, ready, tuple(peers), tuple(payloads), tuple(scales), tokens, n, k, capacity, len(peers[0]), rank,
+        head_dim, segments, BM=bm, num_warps=4)
+    return _require_native_mxfp8(kernel)
+
+
+def mxfp8_wgrad(dy, x, out, *, accumulate=False):
+    dq, ds = mxfp8_quantize(dy.T)
+    xq, xs = mxfp8_quantize(x.T)
+    kernel = _mx_wgrad[(triton.cdiv(dy.shape[1], 128) * triton.cdiv(x.shape[1], 128),)](
+        dq, ds, xq, xs, out, dq.shape[1], dy.shape[1], x.shape[1], accumulate, BM=128, num_warps=4)
+    return _require_native_mxfp8(kernel)
+
+
+def mxfp8_stage(inputs, outputs, peers, capacity):
+    """Publish head-side sources in symmetric buffers without an allocation."""
+    rows, width = inputs[0].shape
+    _copy_rank_rows[(triton.cdiv(capacity * width, 4096), peers, len(inputs))](
+        tuple(inputs), tuple(outputs), rows // peers, capacity, width, 4096, num_warps=4)

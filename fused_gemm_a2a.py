@@ -1,4 +1,4 @@
-"""BF16 Ulysses projections with caller-owned weights and autograd.
+"""Ulysses projections with BF16 interfaces and BF16 or experimental MXFP8 GEMMs.
 
 Sequence side: [M, H]. Head side: [P*M, heads/P, D]. QKV weights use per-head
 [q, k, v, (gate)] rows. All CP ranks use equal M and matching call order.
@@ -26,6 +26,7 @@ from fused_gemm_a2a_kernels import (
     PUSHER_STEADY_WARPS, PUSHER_WARPS, PUSH_SPLIT, SWIZZLE,
     UlyssesGemm, barrier, padded_rows, push_split, reduce_bias_grad, resize_rank_rows,
     tile_swizzle, validate_peer_count, validate_tile_n,
+    mxfp8_push, mxfp8_recv, mxfp8_stage, mxfp8_wgrad, mxfp8_quantize,
 )
 
 __all__ = ['FusedGemmA2AWorkspace', 'FusedQKVProjection', 'FusedOutputProjection']
@@ -233,11 +234,17 @@ def _check(t, shape, label):
         raise ValueError(f'{label} must be a contiguous BF16 tensor of shape {tuple(shape)}, got {tuple(t.shape)}')
 
 
-def _weight_grad(weight, a, b):
+def _weight_grad(weight, a, b, precision="bf16"):
     """dW = a^T b. With Megatron's gradient-accumulation fusion the parameter carries an fp32
     `main_grad`: accumulate into it with an fp32-output GEMM and return a dummy gradient (see
     _accumulated); otherwise return the BF16 gradient for autograd."""
     main_grad = getattr(weight, 'main_grad', None)
+    if precision == 'mxfp8':
+        if main_grad is not None and (main_grad.dtype != torch.float32 or not main_grad.is_contiguous()):
+            raise ValueError('MXFP8 accumulation requires contiguous FP32 main_grad')
+        out = torch.empty_like(weight) if main_grad is None else main_grad
+        mxfp8_wgrad(a, b, out, accumulate=main_grad is not None)
+        return out if main_grad is None else _accumulated(weight)
     if main_grad is None:
         return a.t() @ b
     if WGRAD_BACKEND == 'fused_accum':
@@ -293,11 +300,8 @@ class _FusedQKV(torch.autograd.Function):
         tokens = x.shape[0]
         comm = workspace.comm
         comm.barrier()  # Prior consumers complete before buffer reuse.
-        comm.gemm('push', x, weight, False, workspace.heads[0], workspace.peer_heads,
-                  workspace.counters, 0,
-                  module.n_q, module.segments, a_rows=workspace.capacity,
-                  head_dim=module.head_dim,
-                  bias=bias if module.bias_in_gemm else None)  # TMA zero-fills rows beyond x
+        workspace.run_push(x, weight, False, module.segments,
+                           bias=bias if module.bias_in_gemm else None)
         comm.barrier()  # Incoming tiles are complete.
         ctx.module = module
         ctx.workspace, ctx.tokens = workspace, tokens
@@ -328,7 +332,7 @@ class _FusedQKV(torch.autograd.Function):
         # Saved-tensor hooks may unpack a Parameter as a plain Tensor. Use
         # the original parameter for main_grad and DDP metadata; the unpacked
         # weight above still supplies the saved numerical value for dgrad.
-        dw = _weight_grad(module.weight, dy, x)
+        dw = _weight_grad(module.weight, dy, x, workspace.precision)
         db = _bias_grad(module.bias if ctx.has_bias else None, dy, module.accumulate_bias_grad)
         return dx[:tokens], dw, db, None, None
 
@@ -363,10 +367,9 @@ class _FusedOutput(torch.autograd.Function):
         module, comm = ctx.module, workspace.comm
         dy = dy.contiguous()
         comm.barrier()
-        comm.gemm('push', dy, weight, True, workspace.heads[0], workspace.peer_heads, workspace.counters, 0,
-                  weight.shape[1], 1, a_rows=workspace.capacity)  # TMA zero-fills rows beyond dy
+        workspace.run_push(dy, weight, True, 1)
         comm.barrier()
-        dw = _weight_grad(module.weight, dy, o_seq)  # Metadata belongs to the original Parameter.
+        dw = _weight_grad(module.weight, dy, o_seq, workspace.precision)  # Metadata belongs to the original Parameter.
         db = _bias_grad(module.bias, dy, module.accumulate_bias_grad) if ctx.has_bias else None
         # Strip padding and own dO in one copy: other backwards may reuse the workspace.
         do, = resize_rank_rows(workspace.heads, comm.p, tokens, copy=True)
@@ -379,6 +382,7 @@ class _ProjectionBuffers:
     def __init__(self, comm, capacity, hidden_size, head_dim, segments):
         self.comm, self.capacity, self.head_dim = comm, capacity, head_dim
         self.workspaces = {}
+        self.mx_heads = None
         self.heads, self.peer_heads = [], []
         for i in range(segments):
             key = ('dhead' if segments == 1 else 'head', i)
@@ -391,20 +395,56 @@ class _ProjectionBuffers:
         torch.cuda.synchronize()
         dist.barrier(comm.group)
 
+    def init_mxfp8(self):
+        if self.mx_heads is not None:
+            return
+        self.mx_heads, self.mx_peers, self.mx_scales = [], [], []
+        self.mx_recv = (torch.empty_like(self.recv, dtype=torch.float8_e4m3fn),
+                        torch.empty((self.recv.shape[0], self.recv.shape[1] // 32),
+                                    device=self.recv.device, dtype=torch.uint8))
+        self.mx_ready = torch.empty(self.capacity // 128, device=self.recv.device, dtype=torch.int32)
+        for head in self.heads:
+            q, qp = self.comm.symmetric(tuple(head.shape), torch.float8_e4m3fn)
+            s, sp = self.comm.symmetric((head.shape[0], head.shape[1] // 32), torch.uint8)
+            self.mx_heads.append((q, s))
+            self.mx_peers.append(qp)
+            self.mx_scales.append(sp)
+
 
 class _ProjectionWorkspace:
     """Views of a fixed allocation, sized for this invocation's active row capacity."""
 
-    def __init__(self, buffers, capacity):
+    def __init__(self, buffers, capacity, precision):
         self.comm, self.capacity, self.head_dim = buffers.comm, capacity, buffers.head_dim
+        self.precision = precision
         self.heads = [buf[:self.comm.p * capacity] for buf in buffers.heads]
         self.peer_heads = buffers.peer_heads
         self.recv, self.peer_recv = buffers.recv[:capacity], buffers.peer_recv
         self.counters, self.peer_counters = buffers.counters[:capacity // CTA_M], buffers.peer_counters
         self.epoch = buffers.epoch
+        if precision == 'mxfp8':
+            self.mx_heads = [(q[:self.comm.p * capacity], s[:self.comm.p * capacity])
+                             for q, s in buffers.mx_heads]
+            self.mx_peers, self.mx_scales = buffers.mx_peers, buffers.mx_scales
+            self.mx_recv = tuple(t[:capacity] for t in buffers.mx_recv)
+            self.mx_ready = buffers.mx_ready[:capacity // 128]
+
+    def run_push(self, a, weight, b_is_kn, segments, bias=None):
+        if self.precision == 'mxfp8':
+            mxfp8_push(a, weight, self.peer_heads, rank=self.comm.rank,
+                       capacity=self.capacity, head_dim=self.head_dim,
+                       segments=segments, b_is_kn=b_is_kn, bias=bias)
+        else:
+            width = weight.shape[1] if b_is_kn else weight.shape[0]
+            self.comm.gemm('push', a, weight, b_is_kn, self.heads[0], self.peer_heads,
+                           self.counters, 0, width // segments, segments,
+                           a_rows=self.capacity, head_dim=self.head_dim, bias=bias)
 
     def begin_recv(self):
-        self.comm.barrier(bump=True, epoch=self.epoch, counters=self.counters)
+        if self.precision == 'mxfp8':
+            self.comm.barrier()
+        else:
+            self.comm.barrier(bump=True, epoch=self.epoch, counters=self.counters)
 
     def run_recv(self, inputs, weight, b_is_kn, out):
         """Receive-side GEMM: `inputs` (head-side [T, C] tensors, one per segment) are pushed to the
@@ -414,6 +454,18 @@ class _ProjectionWorkspace:
             raise ValueError('All head-side inputs must have the same shape')
         if shape[0] % self.comm.p:
             raise ValueError('Head-side rows must divide evenly over CP ranks')
+        if self.precision == 'mxfp8':
+            mxfp8_stage(inputs, self.heads, self.comm.p, self.capacity)
+            for head, quantized in zip(self.heads, self.mx_heads):
+                mxfp8_quantize(head, quantized)
+            self.mx_ready.zero_()
+            self.comm.barrier()
+            mxfp8_recv(weight, out, self.recv, self.mx_recv, self.mx_ready,
+                       self.peer_heads, self.mx_peers, self.mx_scales, rank=self.comm.rank,
+                       capacity=self.capacity, tokens=shape[0] // self.comm.p,
+                       head_dim=self.head_dim, segments=len(inputs), b_is_kn=b_is_kn)
+            self.comm.barrier()  # All peer readers finish before the next workspace use.
+            return
         srcs = [t.data_ptr() for t in inputs]
         self.comm.recv_gemm(self.recv, weight, b_is_kn, out, self.peer_recv, self.peer_counters, self.counters,
                             len(inputs), srcs, self.head_dim,
@@ -433,10 +485,15 @@ class FusedGemmA2AWorkspace:
     max_local_tokens: int
     cp_group: object = None
     gate: bool = False
+    precision: str = "bf16"
     comm: object = field(init=False, repr=False)
     _buffers: dict = field(init=False, repr=False)
 
     def __post_init__(self):
+        if self.precision not in ('bf16', 'mxfp8'):
+            raise ValueError('precision must be bf16 or mxfp8')
+        if self.precision == 'mxfp8' and self.hidden_size != 128 * self.num_heads:
+            raise ValueError('Experimental MXFP8 requires head_dim=128')
         capacity = padded_rows(self.max_local_tokens, MMA_TILER_MN[0])
         if self.num_heads <= 0 or self.hidden_size <= 0 or self.hidden_size % self.num_heads:
             raise ValueError('hidden_size must be positive and divisible by num_heads')
@@ -461,11 +518,15 @@ class FusedGemmA2AWorkspace:
             if key not in comm.projection_buffers:
                 comm.projection_buffers[key] = _ProjectionBuffers(comm, *key)
             buffers[segments] = comm.projection_buffers[key]
+            if self.precision == 'mxfp8':
+                buffers[segments].init_mxfp8()
         object.__setattr__(self, 'cp_group', group)
         object.__setattr__(self, 'comm', comm)
         object.__setattr__(self, '_buffers', buffers)
 
     def _validate(self, module, tensor):
+        if self.precision == 'mxfp8' and type(module.weight) not in (torch.Tensor, nn.Parameter):
+            raise TypeError('MXFP8 currently takes BF16 master weights, not quantized Parameter subclasses')
         if (module.weight.shape[1] != self.hidden_size or module.num_heads != self.num_heads
                 or module.segments not in self._buffers):
             raise ValueError('Workspace hidden size, head count and QKV/QKVG mode must match the projection')
@@ -482,9 +543,10 @@ class FusedGemmA2AWorkspace:
         if local_tokens > self.max_local_tokens:
             raise ValueError(f'local_tokens={local_tokens} exceeds max_local_tokens={self.max_local_tokens}')
         buffers = self._buffers[segments]
-        if capacity not in buffers.workspaces:
-            buffers.workspaces[capacity] = _ProjectionWorkspace(buffers, capacity)
-        return buffers.workspaces[capacity]
+        key = (capacity, self.precision)
+        if key not in buffers.workspaces:
+            buffers.workspaces[key] = _ProjectionWorkspace(buffers, capacity, self.precision)
+        return buffers.workspaces[key]
 
 
 def _check_workspace(workspace, module, tensor):

@@ -4,6 +4,9 @@ Fused projection GEMMs and Ulysses all-to-all, with backward, for BF16 MHA
 training on NVLink-connected GB200 (SM100) GPUs.
 **GQA is not supported yet.**
 
+The `codex/mxfp8` branch also provides an experimental MXFP8 path. It is
+not part of the v0.1.0 release; BF16 remains the default.
+
 ## How it works
 
 QKV/QKVG GEMMs send completed tiles directly to peer GPUs over NVLink.
@@ -89,6 +92,44 @@ y.backward(grad_y)
 
 Parameter gradients are rank-local; the trainer handles CP/DP gradient reduction.
 
+### Experimental MXFP8
+
+Select the GEMM precision on the workspace; projection calls stay the same.
+
+```python
+workspace = FusedGemmA2AWorkspace(
+    H, N, max_local_tokens=M_max, cp_group=cp_group,
+    gate=True, precision="mxfp8",
+)
+q, k, v, gate = qkvg(x, workspace)
+y = proj(vsa(q, k, v, gate), workspace)
+y.backward(grad_y)
+```
+
+Forward, input-gradient and weight-gradient GEMMs use native SM100 MXFP8
+instructions with FP32 accumulation. Each operand is independently quantized
+to E4M3 along its reduction axis, with an E8M0 scale per 32 values. Scales use
+`ceil(log2(amax / 448))`; this policy is not a bitwise TE compatibility claim.
+
+Inputs, outputs and caller-owned master weights remain BF16.
+The path requires `D=128` and supports optional bias and FP32 `main_grad`
+accumulation. TE quantized Parameter subclasses are not accepted yet.
+Quantization runs on every invocation, including CUDA Graph replay after
+weight updates. QKV/output-gradient tiles are sent as BF16. Receive GEMMs
+elect one producer CTA per row tile to gather peer payloads/scales and save
+the BF16 operand for backward; other column CTAs reuse those local rows.
+This prototype uses a different pipeline from the BF16 receive-pusher path.
+
+```bash
+torchrun --standalone --nproc-per-node=4 tests/mxfp8_driver.py \
+  --lengths 1 33 1153 --output results/mxfp8-parity.json
+torchrun --standalone --nproc-per-node=4 benchmark/mxfp8.py \
+  --cp 4 --gate --tokens 131072 --output results/mxfp8-timing.json
+```
+
+The timing comparison includes quantization and reports BF16-equivalent MFU
+using the same 2500 TFLOPS denominator for both paths.
+
 ## Execution constraints
 
 - **CP ranks:** Use equal `M` and `M_max`, and the same call order.
@@ -142,6 +183,25 @@ torchrun --standalone --nproc-per-node=4 benchmark/run.py \
 Add `--gate` for QKVG and `--profile` for Torch traces. For CP8/CP16, use
 multi-node torchrun on 2/4 four-GPU nodes with matching `--cp`.
 CPU checks: `python -m unittest discover -s tests`.
+
+### Experimental MXFP8 status
+
+The MXFP8 path is numerically validated but currently **slower than BF16**.
+It remains a development implementation, not a throughput replacement.
+
+GB200 NVLink, 131,072 tokens, 32 heads × 128, QKVG + output projections,
+bias enabled, CUDA Graphs. Same-job comparison; times are forward / backward.
+
+| CP | BF16 (ms) | MXFP8 (ms) |
+| ---: | ---: | ---: |
+| 8 | 2.980 / 5.135 | 3.835 / 10.675 |
+| 16 | 1.263 / 2.301 | 2.196 / 6.501 |
+
+CP8 and CP16 each pass 660 independent quantized-reference checks, including
+changed-weight graph replay and FP32 gradient accumulation. Maximum relative
+L2 error is below 2.84e-4. Native block-scaled MMA is checked for every GEMM
+specialization. DiT integration and end-to-end training validation remain
+separate work.
 
 ## License
 
