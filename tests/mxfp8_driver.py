@@ -8,6 +8,7 @@ transpose an already quantized payload or differentiate quantization itself.
 """
 import argparse
 from datetime import timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -157,6 +158,17 @@ def main():
                     assert len(actual) == len(expected)
                     for i, (a, b) in enumerate(zip(actual, expected)):
                         check(a, b, f'{segments}/{bias_mode}/{m}/{accumulate}/{label}/{i}')
+                    # Compare streaming quantization with the standalone
+                    # quantizer, including padding and changed-input graphs.
+                    for count in (segments, 1):
+                        view = workspace._view(m, count)
+                        payload, scales = kernels.mxfp8_quantize(view.recv, k_multiple=128)
+                        valid = torch.tensor(
+                            int(torch.equal(view.mx_recv.view(torch.uint8), payload.view(torch.uint8))
+                                and torch.equal(view.mx_scale, scales)),
+                            device=device)
+                        dist.all_reduce(valid, op=dist.ReduceOp.MIN)
+                        assert valid.item(), ('received quantization', count, m, label)
                 # Identity saved-tensor hooks exercise metadata ownership.
                 with torch.autograd.graph.saved_tensors_hooks(lambda x: x, lambda x: x):
                     compare(step(), 'eager')
@@ -205,6 +217,27 @@ def main():
                     check(out, quantized(dy.T) @ quantized(x.T).T,
                           f'local/{width}/{tokens}/graph{replay}')
                 graph.reset()
+    # Exhaust the finite BF16 magnitudes at the quantization boundary. Each
+    # 32-value group has a constant magnitude, so every possible scale boundary
+    # (including subnormals and zero) is exercised by the receive quantizer.
+    values = torch.arange(0x7f80, device=device, dtype=torch.int32).to(torch.int16)
+    values = values.view(torch.bfloat16).repeat_interleave(32)
+    local_rows = -(-values.numel() // (h * 256)) * 256
+    values = F.pad(values, (0, local_rows * h - values.numel()))
+    inputs = values.view(p * local_rows, args.heads // p, d)
+    workspace = FusedGemmA2AWorkspace(h, args.heads, local_rows, precision='mxfp8')
+    projection = FusedOutputProjection(
+        h, args.heads, weight=torch.zeros(h, h, device=device, dtype=torch.bfloat16))
+    for sign in (1, -1):
+        signed = (inputs.view(torch.int16) ^ (0 if sign == 1 else -32768)).view(torch.bfloat16)
+        projection(signed, workspace)
+        view = workspace._view(local_rows, 1)
+        payload, scales = kernels.mxfp8_quantize(view.recv, k_multiple=128)
+        valid = torch.tensor(
+            int(torch.equal(view.mx_recv.view(torch.uint8), payload.view(torch.uint8))
+                and torch.equal(view.mx_scale, scales)), device=device)
+        dist.all_reduce(valid, op=dist.ReduceOp.MIN)
+        assert valid.item(), ('exhaustive BF16 receive quantization', sign)
     dy = torch.randn(128, h, device=device, dtype=torch.bfloat16)
     out = torch.empty(h, h, device=device, dtype=torch.float32)
     compiled = mxfp8_wgrad(dy, dy, out)
@@ -217,7 +250,13 @@ def main():
     if rank == 0:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(dict(cp=p, heads=args.heads, lengths=args.lengths,
-                                              native_block_scaled_mma=True, errors=errors), indent=2)+'\n')
+                                              native_block_scaled_mma=True,
+                                              receive_quantization_byte_exact=True,
+                                              exhaustive_bf16_scale_parity=True,
+                                              source_sha256={name: hashlib.sha256(
+                                                  (Path(__file__).resolve().parents[1] / name).read_bytes()).hexdigest()
+                                                  for name in ('fused_gemm_a2a.py', 'fused_gemm_a2a_kernels.py')},
+                                              errors=errors), indent=2)+'\n')
         args.output.with_suffix('.ptx').write_text(ptx)
         print('MXFP8_PASS', len(errors), 'native_block_scaled_mma=True', flush=True)
     dist.barrier()

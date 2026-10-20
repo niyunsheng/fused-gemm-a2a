@@ -117,8 +117,10 @@ accumulation. TE quantized Parameter subclasses are not accepted yet.
 Quantization runs on every invocation, including CUDA Graph replay after
 weight updates. QKV/output-gradient tiles are sent as BF16. Receive GEMMs
 use the same CuTe persistent GEMM and receive-pusher pipeline as BF16.
-Pusher warps transfer payloads, scales and the BF16 operand saved for backward,
-then publish row completion counters. TMA waits for complete rows before MMA.
+Pusher warps transfer only BF16. Dedicated receiver warps quantize completed
+blocks into local FP8/scale buffers; TMA waits for quantization before MMA.
+The original BF16 operands remain available for backward. Communication and
+quantization overlap with GEMM inside the persistent kernel.
 MXFP8 quantization, row copies and bias reductions also use CuTe DSL.
 The BF16 path retains its existing Triton copies and reductions.
 
@@ -129,8 +131,8 @@ torchrun --standalone --nproc-per-node=4 benchmark/mxfp8.py \
   --cp 4 --gate --tokens 131072 --output results/mxfp8-timing.json
 ```
 
-The timing comparison includes quantization and reports BF16-equivalent MFU
-using the same 2500 TFLOPS denominator for both paths.
+Timing includes quantization. Results report native MFU using 2500 TFLOPS
+for BF16 and 5000 TFLOPS for MXFP8, plus BF16-equivalent MFU in the JSON output.
 
 ## Execution constraints
 
@@ -188,29 +190,31 @@ CPU checks: `python -m unittest discover -s tests`.
 
 ### Experimental MXFP8 status
 
-The MXFP8 path uses CuTe DSL throughout its custom kernels. CP8 and CP16 each
-pass 678 independent quantized-reference comparisons, including backward,
-bias, FP32 gradient accumulation and changed-input/weight CUDA Graph replay.
-BF16 regression passes 480 comparisons; 21 repository unit tests pass.
+The MXFP8 path uses CuTe DSL throughout its custom kernels and BF16 for all
+activation communication. CP3, CP8 and CP16 each pass 678 independent
+quantized-reference comparisons, including backward, bias, FP32 gradient
+accumulation and changed-input/weight CUDA Graph replay. Receive quantization
+matches the standalone quantizer byte for byte, including every finite BF16
+scale boundary. BF16 regression passes 480 comparisons; 21 unit tests pass.
 
 GB200 · PyTorch 26.04 · CUDA 13.2 · CUTLASS 4.6.2 · H4096 · 32 heads × 128 ·
 QKVG + output projections · bias enabled · CUDA Graphs.
-All pairs below are **forward / backward**; MFU is BF16-equivalent.
+All pairs below are **forward / backward**; MFU uses the native MXFP8 peak.
 Values sum the two projection-stage medians and average runs in both
 precision orders (seven trials per run).
 
-| CP | Tokens | BF16 ms | MXFP8 ms | Speedup | MXFP8 TFLOPS/GPU | MXFP8 MFU |
+| CP | Tokens | BF16 ms | MXFP8 ms | Speedup | MXFP8 TFLOPS/GPU | Native MXFP8 MFU |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8 | 131,072 | 2.575 / 4.727 | 2.218 / 4.252 | 1.16x / 1.11x | 1239.5 / 1292.8 | 49.58% / 51.71% |
-| 8 | 119,296 | 2.714 / 4.446 | 2.097 / 3.911 | 1.29x / 1.14x | 1192.9 / 1279.2 | 47.72% / 51.17% |
-| 16 | 131,072 | 1.297 / 2.449 | 1.201 / 2.171 | 1.08x / 1.13x | 1144.0 / 1265.8 | 45.76% / 50.63% |
-| 16 | 119,296 | 1.325 / 2.320 | 1.144 / 2.093 | 1.16x / 1.11x | 1093.8 / 1195.3 | 43.75% / 47.81% |
+| 8 | 131,072 | 2.499 / 4.597 | 1.974 / 3.520 | 1.27x / 1.31x | 1392.2 / 1561.6 | 27.84% / 31.23% |
+| 8 | 119,296 | 2.639 / 4.333 | 1.855 / 3.268 | 1.42x / 1.33x | 1348.6 / 1531.3 | 26.97% / 30.63% |
+| 16 | 131,072 | 1.304 / 2.490 | 1.110 / 1.889 | 1.18x / 1.32x | 1238.2 / 1455.5 | 24.76% / 29.11% |
+| 16 | 119,296 | 1.347 / 2.352 | 1.068 / 1.789 | 1.26x / 1.31x | 1171.6 / 1398.7 | 23.43% / 27.97% |
 
-NCU-guided tuning vectorizes owned-output copies, reduces shared-memory bank
-conflicts in transpose quantization, and uses N=256 for receive/local GEMMs.
-The combined projections win in both precision orders for every row above;
-output-projection forward alone still regresses. This is not a DiT training
-MFU or convergence result, and MXFP8 remains on the experimental branch.
+BF16-equivalent MFU is twice the native MXFP8 percentage above.
+All four projection stages beat BF16 at these shapes. Receiver quantization
+removes duplicate FP8/scale transport and five standalone quantization kernels.
+This is not a DiT training MFU or convergence result; MXFP8 remains on the
+experimental branch.
 
 For the MXFP8 benchmark, use `--bias --warmup 10 --iterations 128 --trials 7
 --graph-batch 8`, then repeat with `--precision-order mxfp8-first`.

@@ -293,8 +293,7 @@ def _push_one(job: Int32, lane: Int32, p: Constexpr, rank: Constexpr, m_local: C
               num_in: Constexpr, split: Constexpr, head_dim: Constexpr,
               dst_ptrs: cute.Tensor, cnt_ptrs: cute.Tensor,
               src0: Int64, src1: Int64, src2: Int64, src3: Int64,
-              src_rows: Int32, padded: Constexpr, mxfp8: Constexpr,
-              mx_dest: cute.Tensor, sf_dest: cute.Tensor, mx_sources: tuple):
+              src_rows: Int32, padded: Constexpr):
     """One pusher job of one warp. Job = (row block, segment, destination, row sub-block): copy the
     sub-block of this rank's head-side input into the destination's receive buffer, then release the
     destination's counter for that row block. QKV receive columns follow Megatron's
@@ -347,9 +346,6 @@ def _push_one(job: Int32, lane: Int32, p: Constexpr, rank: Constexpr, m_local: C
             dtype, dst_ptrs[d] + (row0 * k_total + rank * seg_width) * 2,
             cute.AddressSpace.gmem, assumed_align=16), dst_layout)
         _copy_recv_tile(tiled_copy, thr_copy, src, dst, row0, src_rows, padded)
-    if const_expr(mxfp8):
-        _mx_copy_quantized(lane, d, t, row0, sub_rows, p, rank, m_local, k_total,
-                           num_in, head_dim, src_rows, mx_dest, sf_dest, mx_sources)
     # The warp barrier orders every lane's stores before lane 0's release, and a release is
     # cumulative, so no separate fence.acq_rel.sys is needed; the probe measured the fence at
     # about 15% of pusher bandwidth with 64 KB jobs.
@@ -365,8 +361,7 @@ def _push_jobs(lane: Int32, program: Int32, pusher: Int32, num_programs: Int32, 
                m_local: Constexpr, k_total: Constexpr, num_in: Constexpr, split: Constexpr,
                head_dim: Constexpr,
                dst_ptrs: cute.Tensor, cnt_ptrs: cute.Tensor,
-               src0: Int64, src1: Int64, src2: Int64, src3: Int64, src_rows: Int32, padded: Constexpr, mxfp8: Constexpr,
-               mx_dest: cute.Tensor, sf_dest: cute.Tensor, mx_sources: tuple):
+               src0: Int64, src1: Int64, src2: Int64, src3: Int64, src_rows: Int32, padded: Constexpr):
     """Pusher job loop of warp `pusher` (0..warps-1) inside recv GEMM program `program`.
     Jobs are ordered by row block and
     spread over the warps, so row blocks complete early and in order. Two phases: all warps push the
@@ -378,11 +373,11 @@ def _push_jobs(lane: Int32, program: Int32, pusher: Int32, num_programs: Int32, 
     first_jobs = min(first_blocks, m_local // CTA_M) * jobs_per_block
     for job in range(program * warps + pusher, first_jobs, num_programs * warps):
         _push_one(job, lane, p, rank, m_local, k_total, num_in, split, head_dim, dst_ptrs, cnt_ptrs,
-                  src0, src1, src2, src3, src_rows, padded, mxfp8, mx_dest, sf_dest, mx_sources)
+                  src0, src1, src2, src3, src_rows, padded)
     if pusher < steady_warps:
         for job in range(first_jobs + program * steady_warps + pusher, num_jobs, num_programs * steady_warps):
             _push_one(job, lane, p, rank, m_local, k_total, num_in, split, head_dim, dst_ptrs,
-                      cnt_ptrs, src0, src1, src2, src3, src_rows, padded, mxfp8, mx_dest, sf_dest, mx_sources)
+                      cnt_ptrs, src0, src1, src2, src3, src_rows, padded)
 
 
 # ----------------------------------------------------------------------------
@@ -439,6 +434,7 @@ class UlyssesGemm:
         # recv mode adds pusher warps after the TMA warp; they copy this rank's head-side input into
         # the peers' receive buffers while the other warps compute, so the two always share the SM.
         self.pusher_warps = PUSHER_WARPS if mode == 'recv' else 0
+        self.quant_warps = 0
         self.threads_per_cta = 32 * (6 + self.pusher_warps)
         self.epilog_sync_bar_id = 1
         self.tmem_alloc_sync_bar_id = 2
@@ -509,7 +505,7 @@ class UlyssesGemm:
     def __call__(self, a: cute.Pointer, b: cute.Pointer, c: cute.Pointer, bias: cute.Pointer, aux0: cute.Pointer, aux1: cute.Pointer,
                  aux2: cute.Pointer, aux3: cute.Pointer, counters: cute.Pointer,
                  src0: Int64, src1: Int64, src2: Int64, src3: Int64, src_rows: Int32,
-                 scales: tuple, mx_sources: tuple,
+                 scales: tuple,
                  max_active_clusters: Constexpr, stream: cuda.CUstream):
         """Arguments are device pointers; the (static) shapes live in a_shape, b_shape and c_shape, so
         the host passes bare addresses and never keeps a tensor alive. a [M, K]; b [N, K] or [K, N]
@@ -606,7 +602,7 @@ class UlyssesGemm:
                     bias, aux0, aux1, aux2, aux3, counters, src0, src1, src2, src3, src_rows,
                     self.cluster_layout_vmnk,
                     self.a_smem_layout_staged, self.b_smem_layout_staged, self.c_smem_layout_staged,
-                    self.epi_tile, tile_sched_params, scale_args, mx_sources).launch(
+                    self.epi_tile, tile_sched_params, scale_args, (a.iterator, scales[0])).launch(
             grid=grid, block=[self.threads_per_cta, 1, 1], cluster=(*self.cluster_shape_mn, 1), stream=stream,
             min_blocks_per_mp=1)  # bounds registers to the 10-warp program
 
@@ -646,7 +642,7 @@ class UlyssesGemm:
                cluster_layout_vmnk: cute.Layout,
                a_smem_layout_staged: cute.ComposedLayout, b_smem_layout_staged: cute.ComposedLayout,
                c_smem_layout_staged: cute.ComposedLayout, epi_tile: cute.Tile,
-               tile_sched_params: utils.PersistentTileSchedulerParams, scale_args: tuple, mx_sources: tuple):
+               tile_sched_params: utils.PersistentTileSchedulerParams, scale_args: tuple, quant_outputs: tuple):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -765,15 +761,24 @@ class UlyssesGemm:
         # instead of all sharing the link bandwidth and finishing together.
         #
         if const_expr(self.mode == 'recv' and self.pusher_warps > 0):
-            if warp_idx > self.tma_warp_id:
+            if warp_idx > self.tma_warp_id and warp_idx <= self.tma_warp_id + self.pusher_warps:
                 pusher_idx = warp_idx - (self.tma_warp_id + 1)
                 # The first row group of the N raster covers `swizzle` clusters of rows.
                 first_blocks = self.swizzle * self.mma_tiler[0] // CTA_M
                 _push_jobs(tidx % 32, cta_linear, pusher_idx, num_ctas, self.pusher_warps, PUSHER_STEADY_WARPS,
                            first_blocks, self.p, self.rank, self.recv_m, self.recv_k, self.num_in, self.push_split,
                            self.head_dim, aux0, aux1,
-                           src0, src1, src2, src3, src_rows, self.pad_recv,
-                           self.mxfp8, aux2, aux3, mx_sources)
+                           src0, src1, src2, src3, src_rows, self.pad_recv)
+            if const_expr(self.mxfp8):
+                if warp_idx > self.tma_warp_id + self.pusher_warps:
+                    quant_idx = warp_idx - (self.tma_warp_id + self.pusher_warps + 1)
+                    recv_input = cute.make_ptr(cutlass.BFloat16, aux0[self.rank],
+                                              cute.AddressSpace.gmem, assumed_align=16)
+                    _mx_quantize_received(tidx % 32, cta_linear, quant_idx, num_ctas, self.quant_warps,
+                                         self.recv_m, self.recv_k,
+                                         self.p * self.num_in * self.push_split,
+                                         recv_input, quant_outputs[0],
+                                         cute.recast_ptr(quant_outputs[1], dtype=cutlass.Uint8), counters)
 
         #
         # TMA load warp
@@ -783,6 +788,8 @@ class UlyssesGemm:
             target = Int32(0)
             if const_expr(self.mode == 'recv' and self.pusher_warps > 0):
                 target = Int32(self.p * self.num_in * self.push_split)
+                if const_expr(self.mxfp8):
+                    target += CTA_M // 8
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
                 m_cta = cur_tile_coord[0]                 # 128-row block owned by this CTA
@@ -1219,37 +1226,65 @@ def _mx_quant_launch(a: cute.Pointer, q: cute.Pointer, sf: cute.Pointer,
 
 
 @cute.jit
-def _mx_copy_quantized(lane, dest, segment, row0, sub_rows: Constexpr,
-                        p: Constexpr, rank: Constexpr, m_local: Constexpr, k_total: Constexpr,
-                        num_in: Constexpr, head_dim: Constexpr, src_rows,
-                        dest_q: cute.Tensor, dest_s: cute.Tensor, sources: tuple):
-    width = k_total // (p * num_in)
-    srcq, srcs = sources[0], sources[4]
-    for i in cutlass.range_constexpr(num_in):
-        if segment == i:
-            srcq, srcs = sources[i], sources[4 + i]
-    qptr = cute.make_ptr(cutlass.Float8E4M3FN, srcq, cute.AddressSpace.gmem, assumed_align=16)
-    sptr = cute.make_ptr(cutlass.Uint8, srcs, cute.AddressSpace.gmem, assumed_align=16)
-    dq = cute.make_ptr(cutlass.Float8E4M3FN, dest_q[dest], cute.AddressSpace.gmem, assumed_align=16)
-    ds = cute.make_ptr(cutlass.Uint8, dest_s[dest], cute.AddressSpace.gmem, assumed_align=16)
-    atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128)
-    tiled = cute.make_tiled_copy_tv(atom, cute.make_layout((4, 8), stride=(8, 1)),
-                                    cute.make_layout((1, 16), stride=(16, 1)))
-    copy = tiled.get_slice(lane)
-    for head in range(width // head_dim):
-        column = ((rank * (width // head_dim) + head) * num_in + segment) * head_dim
-        src = cute.make_tensor(qptr + (dest * src_rows + row0) * width + head * head_dim,
-                               cute.make_layout((sub_rows, head_dim), stride=(width, 1)))
-        dst = cute.make_tensor(dq + row0 * k_total + column,
-                               cute.make_layout((sub_rows, head_dim), stride=(k_total, 1)))
-        _copy_recv_tile(tiled, copy, src, dst, row0, src_rows, True)
-        # Scale bytes are permuted between the source and destination row layouts.
-        for idx in range(lane, sub_rows * (head_dim // 32), 32):
-            r, group = row0 + idx // (head_dim // 32), idx % (head_dim // 32)
-            scale = cutlass.Uint8(127)
-            if r < src_rows:
-                scale = sptr[_mx_scale_offset(dest * src_rows + r, head * (head_dim // 32) + group, width // 32)].to(cutlass.Uint8)
-            ds[_mx_scale_offset(r, column // 32 + group, k_total // 32)] = scale
+def _mx_quantize_received(lane: Int32, program: Int32, worker: Int32,
+                         programs: Int32, warps: Constexpr, rows: Constexpr, k: Constexpr,
+                         arrivals: Constexpr, source: cute.Pointer, output: cute.Pointer,
+                         scales: cute.Pointer, counters: cute.Tensor):
+    """Quantize eight complete rows per warp, once per received BF16 block.
+
+    A row counter first reaches `arrivals` after every peer's BF16 writes.
+    Each of the sixteen disjoint eight-row jobs then publishes one completion.
+    TMA waits for `arrivals + 16` before consuming the local FP8/scale buffers.
+    Dedicated resident warps keep communication progressing during these waits.
+    """
+    atom_in = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+    atom_out = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=64)
+    # Batch vector loads before their consumers: two quantization warps alone
+    # cannot hide a global-load round trip for every 32-element group.
+    chunk = 8 if k % 256 == 0 else 4
+    for job in range(program * warps + worker, rows // 8, programs * warps):
+        block = job // (CTA_M // 8)
+        seen = ld_acquire_sys_u32(counters.iterator + block)
+        while seen < arrivals:
+            nanosleep(256)
+            seen = ld_acquire_sys_u32(counters.iterator + block)
+        row = job * 8 + lane // 4
+        for batch in range(k // (32 * chunk)):
+            fragments = [cute.make_rmem_tensor((8,), cutlass.BFloat16) for _ in range(chunk)]
+            for i in cutlass.range_constexpr(chunk):
+                group = batch * chunk + i
+                col = group * 32 + (lane % 4) * 8
+                offset = cute.assume(Int64(row) * k + col, divby=8)
+                src = cute.make_tensor(source + offset, cute.make_layout((8,), stride=(1,)))
+                cute.copy(atom_in, src, fragments[i])
+            for i in cutlass.range_constexpr(chunk):
+                group = batch * chunk + i
+                col = group * 32 + (lane % 4) * 8
+                values = fragments[i].load().to(cutlass.Float32)
+                peak = cute.math.absf(values).reduce(cute.ReductionOp.MAX, cutlass.Float32(0), 0)
+                peak = cute.arch.warp_reduction_max(peak, threads_in_group=4)
+                # peak is exactly BF16. 448 = 1.75 * 2**8, so the
+                # rounded-up power-of-two scale follows from its exponent
+                # and whether its significand exceeds 1.75. This is the same
+                # ceil(log2(peak / 448)) policy without log2/exp2 instructions.
+                exponent = cutlass.Int32(0)
+                if peak > 0:
+                    bits = peak.bitcast(cutlass.Int32)
+                    exponent = (bits >> 23) - 135
+                    if (bits & 0x7fffff) > 0x600000:
+                        exponent += 1
+                    exponent = cutlass.max(-126, cutlass.min(127, exponent))
+                inv_scale = ((127 - exponent) << 23).bitcast(cutlass.Float32)
+                quantized = cute.make_rmem_tensor((8,), cutlass.Float8E4M3FN)
+                quantized.store((values * inv_scale).to(cutlass.Float8E4M3FN))
+                offset = cute.assume(Int64(row) * k + col, divby=8)
+                dst = cute.make_tensor(output + offset, cute.make_layout((8,), stride=(1,)))
+                cute.copy(atom_out, quantized, dst)
+                if lane % 4 == 0:
+                    scales[_mx_scale_offset(row, group, k // 32)] = cutlass.Uint8(exponent + 127)
+        cute.arch.sync_warp()
+        if lane == 0:
+            red_release_sys_add1(counters.iterator + block)
 
 
 _mx_compiled = {}
@@ -1307,7 +1342,7 @@ def mxfp8_wgrad(dy, x, out, *, accumulate=False):
     args = (_mx_ptr(dq), _mx_ptr(xq), _mx_ptr(result), _mx_ptr(result),
             *(_mx_ptr(dummy, align=8) for _ in range(5)),
             *(Int64(0) for _ in range(4)), Int32(dq.shape[0]),
-            (_mx_ptr(ds, cutlass.Float8E8M0FNU), _mx_ptr(xs, cutlass.Float8E8M0FNU)), tuple(Int64(0) for _ in range(8)))
+            (_mx_ptr(ds, cutlass.Float8E8M0FNU), _mx_ptr(xs, cutlass.Float8E8M0FNU)))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     key = ('wgrad', tuple(dq.shape), tuple(xq.shape), tuple(out.shape), out.dtype, out.device.index)
     if key not in _mx_compiled:

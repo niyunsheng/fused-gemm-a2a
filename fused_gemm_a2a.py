@@ -160,9 +160,10 @@ class _Comm:
         return push_split(a.shape[1], p, num_in, PUSH_SPLIT)
 
     def gemm(self, mode, a, b, b_is_kn, c, aux, counters, num_in, n_segment, num_segments, srcs=(0, 0, 0, 0),
-             a_rows=None, head_dim=0, bias=None, src_rows=None, scales=(), mx_sources=()):
+             a_rows=None, head_dim=0, bias=None, src_rows=None, scales=()):
         """Run the Ulysses GEMM. a [M, K]; b [N, K] (b_is_kn=False) or [K, N] (True); see UlyssesGemm.
-        Receive counters reset at the reuse boundary; each row waits for P * num_in * split arrivals.
+        Receive counters reset at the reuse boundary. BF16 waits for all peer
+        arrivals; MXFP8 additionally waits for local quantization completions.
         srcs are the head-side inputs distributed by the GEMM's own pusher warps.
         a_rows (push mode) is the tile-aligned row count the GEMM enumerates; rows of a beyond its logical shape
         read as zero through TMA and land as zero rows in the destinations."""
@@ -200,8 +201,7 @@ class _Comm:
         args = (_ptr(a), _ptr(b), _ptr(c), _ptr(b if bias is None else bias),
                 *(_ptr(x, 8) for x in aux), _ptr(counters, 8),
                 *(Int64(x) for x in srcs), Int32(src_rows),
-                tuple(_ptr(x) for x in (scales or (b, b))),
-                tuple(Int64(x) for x in (mx_sources or (0,) * 8)))
+                tuple(_ptr(x) for x in (scales or (b, b))))
         if key not in self.compiled:
             op = UlyssesGemm(mode, self.p, self.rank, n_segment, num_segments, head_dim, tile_n)
             op.mxfp8 = bool(scales)
@@ -224,7 +224,8 @@ class _Comm:
                 first_jobs = first_blocks * num_in * self.p * op.push_split
                 programs = clusters * CLUSTER_MN[0] * CLUSTER_MN[1]
                 op.pusher_warps = max(PUSHER_STEADY_WARPS, min(PUSHER_WARPS, first_jobs // programs))
-                op.threads_per_cta = 32 * (6 + op.pusher_warps)
+                op.quant_warps = 2 if scales else 0
+                op.threads_per_cta = 32 * (6 + op.pusher_warps + op.quant_warps)
             else:
                 op.pusher_warps = 0
                 op.threads_per_cta = 32 * 6
@@ -410,8 +411,10 @@ class _ProjectionBuffers:
         if self.mx_recv is not None:
             return
         rows, k = self.recv.shape
-        self.mx_recv, self.peer_mx_recv = self.comm.symmetric((rows, k), torch.float8_e4m3fn)
-        self.mx_scale, self.peer_mx_scale = self.comm.symmetric((rows * k // 32,), torch.uint8)
+        # Only BF16 crosses ranks. Quantized inputs and scales are local staging
+        # buffers, populated once per received row block inside the GEMM kernel.
+        self.mx_recv = torch.empty((rows, k), device=self.recv.device, dtype=torch.float8_e4m3fn)
+        self.mx_scale = torch.empty((rows * k // 32,), device=self.recv.device, dtype=torch.uint8)
 
 
 class _ProjectionWorkspace:
@@ -428,7 +431,6 @@ class _ProjectionWorkspace:
         if precision == 'mxfp8':
             self.mx_recv = buffers.mx_recv[:capacity]
             self.mx_scale = buffers.mx_scale[:capacity * self.recv.shape[1] // 32]
-            self.peer_mx_recv, self.peer_mx_scale = buffers.peer_mx_recv, buffers.peer_mx_scale
 
     def run_push(self, a, weight, b_is_kn, segments, bias=None):
         scales = ()
@@ -445,8 +447,11 @@ class _ProjectionWorkspace:
         self.comm.barrier(bump=True, epoch=self.epoch, counters=self.counters)
 
     def run_recv(self, inputs, weight, b_is_kn, out):
-        """Pusher warps publish BF16 saved values, MX payloads and scales before
-        releasing each row counter. TMA then consumes that completed row tile."""
+        """Transfer BF16; receiver warps quantize each completed block locally.
+
+        The BF16 receive buffer also supplies independently quantized wgrad
+        operands and exact bias gradients.
+        """
         shape = inputs[0].shape
         if any(t.shape != shape for t in inputs):
             raise ValueError('All head-side inputs must have the same shape')
@@ -454,17 +459,11 @@ class _ProjectionWorkspace:
             raise ValueError('Head-side rows must divide evenly over CP ranks')
         srcs = [t.data_ptr() for t in inputs]
         if self.precision == 'mxfp8':
-            quantized = [mxfp8_quantize(t, k_multiple=128) for t in inputs]
             weight, sb = mxfp8_quantize(weight.T if b_is_kn else weight)
-            qsrc = [q.data_ptr() for q, _ in quantized]
-            ssrc = [s.data_ptr() for _, s in quantized]
-            qsrc += [qsrc[0]] * (4 - len(qsrc))
-            ssrc += [ssrc[0]] * (4 - len(ssrc))
             self.comm.gemm('recv', self.mx_recv, weight, False, out,
-                           [self.peer_recv, self.peer_counters, self.peer_mx_recv, self.peer_mx_scale],
+                           [self.peer_recv, self.peer_counters],
                            self.counters, len(inputs), 0, 1, srcs=srcs, head_dim=self.head_dim,
-                           src_rows=shape[0] // self.comm.p, scales=(self.mx_scale, sb),
-                           mx_sources=tuple(qsrc + ssrc))
+                           src_rows=shape[0] // self.comm.p, scales=(self.mx_scale, sb))
         else:
             self.comm.recv_gemm(self.recv, weight, b_is_kn, out, self.peer_recv, self.peer_counters, self.counters,
                                len(inputs), srcs, self.head_dim, src_rows=shape[0] // self.comm.p)

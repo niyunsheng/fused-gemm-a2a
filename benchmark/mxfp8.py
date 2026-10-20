@@ -65,7 +65,8 @@ def main():
             flops *= 2 if name.endswith('backward') else 1
             tflops = flops / us / 1e6
             timings[f'{precision}/{name}'] = dict(us=us, tflops=tflops,
-                                                  bf16_equivalent_mfu=tflops/2500)
+                                                  bf16_equivalent_mfu=tflops/2500,
+                                                  native_mfu=tflops/(5000 if precision == 'mxfp8' else 2500))
             runtime.log(precision, name, json.dumps(timings[f'{precision}/{name}']))
         if args.profile:
             from torch.profiler import profile, ProfilerActivity, record_function
@@ -99,6 +100,8 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(dict(config={**vars(args), 'output': str(args.output)},
                                               source_sha256=hashes, mxfp8_backend='cute', timings=timings,
+                                              activation_communication_dtype='bf16',
+                                              peak_tflops_per_gpu=dict(bf16=2500, mxfp8=5000),
                                               kernel_metadata=kernel_metadata,
                                               trials_us=runtime.timing_samples), indent=2)+'\n')
     dist.barrier()
