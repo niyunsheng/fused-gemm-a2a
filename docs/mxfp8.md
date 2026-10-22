@@ -97,3 +97,50 @@ Report native MXFP8 MFU against 5000 TFLOPS/GPU and BF16-equivalent MFU against
 attention, training iterations or convergence. Compare revisions on the same
 allocation with the same harness, retain BF16 control timings, and use
 uninstrumented multi-trial timings for performance conclusions.
+
+## Validation results (2026-10-22)
+
+The production source in `6b09fbf` passes 21 unit tests, eight exhaustive
+payload/scale byte-parity cases, and 76 exact FP32 accumulation comparisons.
+The accumulation checks include nonzero initial gradients, repeated
+changed-input CUDA Graph replay, rectangular output shapes, boundary
+canaries, overwrite/accumulate cache separation and FP32 subnormals.
+
+At CP3, CP8 and CP16, the distributed driver passes 678 independent
+quantized-reference comparisons per configuration, plus byte-exact receive
+quantization and finite-BF16 scale checks. BF16 regression passes 480
+comparisons at each of CP8 and CP16. PTX checks require native block-scaled
+MMA. These checks validate the declared quantized math and storage/lifetime
+contracts; they do not establish full-model convergence.
+
+## Paired performance results (2026-10-22)
+
+GB200, PyTorch 26.04 / CUDA 13.2, CUTLASS DSL 4.6.2, H4096, 32 heads.
+Pairs are **forward / backward**, summing QKVG and output projections.
+Compare implementation `6b09fbf` with `85d1ecc` using the same harness and
+allocation per CP size. Average both precision-order medians; each stage
+uses seven trials, 128 iterations, ten warmups and graph batch eight.
+
+| Mode | CP | Tokens | BF16 ms | MXFP8 ms | Speedup / BF16 | Speedup / 85d1ecc | Native MXFP8 MFU |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| historical | 8 | 131,072 | 2.535 / 4.653 | 1.971 / 3.461 | 1.286x / 1.344x | 1.002x / 1.030x | 27.89% / 31.76% |
+| historical | 8 | 119,296 | 2.672 / 4.376 | 1.855 / 3.231 | 1.440x / 1.354x | 1.000x / 1.020x | 26.97% / 30.97% |
+| historical | 16 | 131,072 | 1.298 / 2.454 | 1.098 / 1.860 | 1.182x / 1.319x | 1.009x / 1.021x | 25.02% / 29.55% |
+| historical | 16 | 119,296 | 1.342 / 2.331 | 1.055 / 1.748 | 1.271x / 1.333x | 1.013x / 1.024x | 23.71% / 28.63% |
+| training | 8 | 131,072 | 2.375 / 4.780 | 1.826 / 3.608 | 1.301x / 1.325x | 1.014x / 1.017x | 30.11% / 30.47% |
+| training | 8 | 119,296 | 2.525 / 4.479 | 1.706 / 3.320 | 1.480x / 1.349x | 1.016x / 1.011x | 29.33% / 30.14% |
+| training | 16 | 131,072 | 1.224 / 2.566 | 1.016 / 2.087 | 1.205x / 1.229x | 1.046x / 1.009x | 27.06% / 26.34% |
+| training | 16 | 119,296 | 1.269 / 2.450 | 0.981 / 1.904 | 1.294x / 1.286x | 1.017x / 1.015x | 25.51% / 26.27% |
+
+Historical mode uses `--gate --bias`; training-style mode uses
+`--gate --main-grad --qkv-bias-only --bias-in-gemm`. BF16 wgrad uses
+the default `torch` backend in both modes. Gradient zeroing is outside
+timing. These are projection measurements, not full-model training MFU.
+
+The largest BF16 aggregate control drift between revisions is 0.84%.
+The small revision-to-revision gains should be read with that variability.
+Native MXFP8 MFU uses 5000 TFLOPS/GPU; BF16-equivalent MFU is twice
+the displayed percentage. Timings are uninstrumented. A separate CP8
+trace confirms that the MXFP8 wgrad path has no separate dW-add kernel.
+
+[Machine-readable results and source hashes](mxfp8-results-20261022.json).

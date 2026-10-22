@@ -194,35 +194,25 @@ CPU checks: `python -m unittest discover -s tests`.
 
 ### Experimental MXFP8 status
 
-The measurements below are from revision `85d1ecc`, before the shared
-bit-based quantizer and direct FP32 wgrad accumulation changes. They are
-retained as historical evidence; the two benchmark modes are documented in
-[the MXFP8 design note](docs/mxfp8.md#performance-measurement).
+The current implementation passes 678 independent quantized-reference
+comparisons at each of CP3/CP8/CP16, 480 BF16 regression comparisons at
+each of CP8/CP16, exhaustive finite-BF16 byte parity, 76 exact FP32
+accumulation checks and 21 unit tests.
 
-The MXFP8 path uses CuTe DSL throughout its custom kernels and BF16 for all
-activation communication. CP3, CP8 and CP16 each pass 678 independent
-quantized-reference comparisons, including backward, bias, FP32 gradient
-accumulation and changed-input/weight CUDA Graph replay. Receive quantization
-matches the standalone quantizer byte for byte, including every finite BF16
-scale boundary. BF16 regression passes 480 comparisons; 21 unit tests pass.
+GB200 · PyTorch 26.04 · CUDA 13.2 · CUTLASS DSL 4.6.2 · H4096 ·
+QKVG + output · FP32 `main_grad` · QKVG-only bias before BF16 rounding ·
+CUDA Graphs. BF16 wgrad uses the default `torch` backend. Pairs below are
+**forward / backward**, averaging both precision-order medians.
 
-GB200 · PyTorch 26.04 · CUDA 13.2 · CUTLASS 4.6.2 · H4096 · 32 heads × 128 ·
-QKVG + output projections · bias enabled · CUDA Graphs.
-All pairs below are **forward / backward**; MFU uses the native MXFP8 peak.
-Values sum the two projection-stage medians and average runs in both
-precision orders (seven trials per run).
+| CP | Tokens | BF16 ms | MXFP8 ms | Speedup | Native MXFP8 MFU |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 131,072 | 2.375 / 4.780 | 1.826 / 3.608 | 1.30x / 1.32x | 30.11% / 30.47% |
+| 8 | 119,296 | 2.525 / 4.479 | 1.706 / 3.320 | 1.48x / 1.35x | 29.33% / 30.14% |
+| 16 | 131,072 | 1.224 / 2.566 | 1.016 / 2.087 | 1.21x / 1.23x | 27.06% / 26.34% |
+| 16 | 119,296 | 1.269 / 2.450 | 0.981 / 1.904 | 1.29x / 1.29x | 25.51% / 26.27% |
 
-| CP | Tokens | BF16 ms | MXFP8 ms | Speedup | MXFP8 TFLOPS/GPU | Native MXFP8 MFU |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8 | 131,072 | 2.499 / 4.597 | 1.974 / 3.520 | 1.27x / 1.31x | 1392.2 / 1561.6 | 27.84% / 31.23% |
-| 8 | 119,296 | 2.639 / 4.333 | 1.855 / 3.268 | 1.42x / 1.33x | 1348.6 / 1531.3 | 26.97% / 30.63% |
-| 16 | 131,072 | 1.304 / 2.490 | 1.110 / 1.889 | 1.18x / 1.32x | 1238.2 / 1455.5 | 24.76% / 29.11% |
-| 16 | 119,296 | 1.347 / 2.352 | 1.068 / 1.789 | 1.26x / 1.31x | 1171.6 / 1398.7 | 23.43% / 27.97% |
-
-BF16-equivalent MFU is twice the native MXFP8 percentage above.
-All four projection stages beat BF16 at these shapes. Receiver quantization
-removes duplicate FP8/scale transport and five standalone quantization kernels.
-This is not a DiT training MFU or convergence result; MXFP8 remains opt-in.
-
-For the MXFP8 benchmark, use `--bias --warmup 10 --iterations 128 --trials 7
---graph-batch 8`, then repeat with `--precision-order mxfp8-first`.
+Native MXFP8 MFU uses 5000 TFLOPS/GPU; BF16-equivalent MFU is twice
+these percentages. This is a projection benchmark, not training MFU or
+convergence evidence. See [the paired results](docs/mxfp8.md#paired-performance-results-2026-10-22)
+for historical bias-mode timings, comparison against `85d1ecc`, source
+hashes and reproduction commands. MXFP8 remains opt-in.
