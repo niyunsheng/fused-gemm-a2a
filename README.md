@@ -4,8 +4,8 @@ Fused projection GEMMs and Ulysses all-to-all, with backward, for BF16 MHA
 training on NVLink-connected GB200 (SM100) GPUs.
 **GQA is not supported yet.**
 
-The `codex/mxfp8` branch also provides an experimental MXFP8 path. It is
-not part of the v0.1.0 release; BF16 remains the default.
+An opt-in experimental MXFP8 path is also available. It is not part of the
+v0.1.0 release; BF16 remains the default.
 
 ## How it works
 
@@ -133,6 +133,10 @@ torchrun --standalone --nproc-per-node=4 benchmark/mxfp8.py \
 
 Timing includes quantization. Results report native MFU using 2500 TFLOPS
 for BF16 and 5000 TFLOPS for MXFP8, plus BF16-equivalent MFU in the JSON output.
+Use `--main-grad --qkv-bias-only --bias-in-gemm` instead of `--bias` to measure
+FP32 gradient accumulation with DiT-style bias placement. The wgrad epilogue
+updates `main_grad` directly. See [MXFP8 design and validation](docs/mxfp8.md)
+for the numerical contract and focused GPU checks.
 
 ## Execution constraints
 
@@ -190,6 +194,11 @@ CPU checks: `python -m unittest discover -s tests`.
 
 ### Experimental MXFP8 status
 
+The measurements below are from revision `85d1ecc`, before the shared
+bit-based quantizer and direct FP32 wgrad accumulation changes. They are
+retained as historical evidence; the two benchmark modes are documented in
+[the MXFP8 design note](docs/mxfp8.md#performance-measurement).
+
 The MXFP8 path uses CuTe DSL throughout its custom kernels and BF16 for all
 activation communication. CP3, CP8 and CP16 each pass 678 independent
 quantized-reference comparisons, including backward, bias, FP32 gradient
@@ -213,8 +222,7 @@ precision orders (seven trials per run).
 BF16-equivalent MFU is twice the native MXFP8 percentage above.
 All four projection stages beat BF16 at these shapes. Receiver quantization
 removes duplicate FP8/scale transport and five standalone quantization kernels.
-This is not a DiT training MFU or convergence result; MXFP8 remains on the
-experimental branch.
+This is not a DiT training MFU or convergence result; MXFP8 remains opt-in.
 
 For the MXFP8 benchmark, use `--bias --warmup 10 --iterations 128 --trials 7
 --graph-batch 8`, then repeat with `--precision-order mxfp8-first`.

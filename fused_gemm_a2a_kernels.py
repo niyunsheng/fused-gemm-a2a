@@ -413,6 +413,7 @@ class UlyssesGemm:
         self.head_dim = head_dim
         self.b_is_kn = False
         self.has_bias = False
+        self.accumulate = False
         self.p, self.rank = p, rank
         self.n_segment = n_segment          # weight rows per [Q|K|V] segment (push mode)
         self.a_rows = None                  # tile rows of A (set by the host; >= logical rows)
@@ -910,6 +911,11 @@ class UlyssesGemm:
                         self, tidx, tCtAcc_base, sC, tCgC_real, epi_tile, num_tiles_executed, fake_base,
                         peer_base, fake_coord, acc_consumer_state, acc_pipeline,
                         bias, b_tile * self.cta_tile_shape_mnk[1])
+                elif const_expr(self.accumulate):
+                    acc_consumer_state = _epilogue_accumulate(
+                        self, tidx, tCtAcc_base, tCgC_real, epi_tile,
+                        (m_tile, b_tile, Int32(0)), mC_real,
+                        acc_consumer_state, acc_pipeline)
                 else:
                     acc_consumer_state = epilogue_tma_store(
                         self, tidx, warp_idx, tma_atom_c, tCtAcc_base, sC, tCgC, epi_tile, num_tiles_executed,
@@ -921,6 +927,49 @@ class UlyssesGemm:
                 cute.arch.fence_acq_rel_sys()
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
+
+
+@cute.jit
+def _epilogue_accumulate(gemm_kernel, tidx: Int32, accumulators: cute.Tensor,
+                         output: cute.Tensor, epi_tile: cute.Tile, coord,
+                         full_output: cute.Tensor, state, acc_pipeline):
+    """Add each completed local FP32 tile to its caller-owned gradient once.
+
+    Tiles have disjoint destinations; no atomics or intermediate dW are needed.
+    Predicate padded M rows by their address before either reading or writing.
+    Logical N is tile aligned, as required by the local GEMM scheduler.
+    """
+    output = transform_partitioned_tensor_layout(output)
+    accumulators = transform_partitioned_tensor_layout(accumulators)
+    t2r, acc_tiles, values = epilogue_tmem_copy_and_partition(
+        gemm_kernel, tidx, accumulators, output, epi_tile, gemm_kernel.use_2cta_instrs)
+    destinations = t2r.get_slice(tidx).partition_D(cute.flat_divide(output, epi_tile))
+    destinations = destinations[(None, None, None, None, None, *coord)]
+    destinations = cute.group_modes(destinations, 3, cute.rank(destinations))
+    acc_tiles = acc_tiles[(None, None, None, None, None, state.index)]
+    acc_tiles = cute.group_modes(acc_tiles, 3, cute.rank(acc_tiles))
+    previous = cute.make_rmem_tensor(values.shape, cutlass.Float32)
+    copy = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float32,
+                               num_bits_per_copy=128)
+    end = full_output.iterator.toint() + cute.size(full_output) * 4
+    acc_pipeline.consumer_wait(state)
+    for tile in range(cute.size(acc_tiles, mode=[3])):
+        destination = destinations[(None, None, None, tile)]
+        # For row-major FP32 output, each TMEM load fragment is contiguous
+        # within one row. N is tile aligned, so the whole fragment is valid
+        # or belongs to a padded M row. Keep TMEM loads warp-converged.
+        valid = destination.iterator.toint() < end
+        previous.fill(0)
+        if valid:
+            cute.copy(copy, destination, previous)
+        cute.copy(t2r, acc_tiles[(None, None, None, tile)], values)
+        values.store(previous.load() + values.load())
+        if valid:
+            cute.copy(copy, values, destination)
+    with cute.arch.elect_one():
+        acc_pipeline.consumer_release(state)
+    state.advance()
+    return state
 
 
 @cute.jit
@@ -1148,6 +1197,23 @@ def _mx_scale_offset(row, group, groups: Constexpr):
     return ((row // 128) * (groups // 4) + group // 4) * 512 + (row % 32) * 16 + (row % 128 // 32) * 4 + group % 4
 
 
+@cute.jit
+def _mx_scale_exponent(peak):
+    """ceil(log2(peak / 448)) for an exact finite BF16 magnitude.
+
+    448 = 1.75 * 2**8. The exponent and significand comparison avoid SFU
+    instructions. Clamping also handles BF16 subnormals; zero uses scale 1.
+    """
+    exponent = cutlass.Int32(0)
+    if peak > 0:
+        bits = peak.bitcast(cutlass.Int32)
+        exponent = (bits >> 23) - 135
+        if (bits & 0x7fffff) > 0x600000:
+            exponent += 1
+        exponent = cutlass.max(-126, cutlass.min(127, exponent))
+    return exponent
+
+
 @cute.kernel
 def _mx_quant_kernel(a: cute.Pointer, q: cute.Pointer, sf: cute.Pointer,
                      rows: Int32, k: Int32, rp: Int32, kp: Int32,
@@ -1204,11 +1270,8 @@ def _mx_quant_kernel(a: cute.Pointer, q: cute.Pointer, sf: cute.Pointer,
             values = fragment.load().to(cutlass.Float32)
         peak = cute.math.absf(values).reduce(cute.ReductionOp.MAX, cutlass.Float32(0), 0)
         peak = cute.arch.warp_reduction_max(peak, threads_in_group=4)
-        exponent = cutlass.Int32(0)
-        if peak > 0:
-            exponent = cute.math.ceil(cute.math.log2(peak / 448.0)).to(cutlass.Int32)
-            exponent = cutlass.max(-126, cutlass.min(127, exponent))
-        inv_scale = cute.math.exp2((-exponent).to(cutlass.Float32))
+        exponent = _mx_scale_exponent(peak)
+        inv_scale = ((127 - exponent) << 23).bitcast(cutlass.Float32)
         quantized.store((values * inv_scale).to(cutlass.Float8E4M3FN))
         dst = cute.make_tensor(q + cute.assume(Int64(row) * kp + col, divby=8), cute.make_layout((8,), stride=(1,)))
         cute.copy(atom_out, quantized, dst)
@@ -1263,17 +1326,7 @@ def _mx_quantize_received(lane: Int32, program: Int32, worker: Int32,
                 values = fragments[i].load().to(cutlass.Float32)
                 peak = cute.math.absf(values).reduce(cute.ReductionOp.MAX, cutlass.Float32(0), 0)
                 peak = cute.arch.warp_reduction_max(peak, threads_in_group=4)
-                # peak is exactly BF16. 448 = 1.75 * 2**8, so the
-                # rounded-up power-of-two scale follows from its exponent
-                # and whether its significand exceeds 1.75. This is the same
-                # ceil(log2(peak / 448)) policy without log2/exp2 instructions.
-                exponent = cutlass.Int32(0)
-                if peak > 0:
-                    bits = peak.bitcast(cutlass.Int32)
-                    exponent = (bits >> 23) - 135
-                    if (bits & 0x7fffff) > 0x600000:
-                        exponent += 1
-                    exponent = cutlass.max(-126, cutlass.min(127, exponent))
+                exponent = _mx_scale_exponent(peak)
                 inv_scale = ((127 - exponent) << 23).bitcast(cutlass.Float32)
                 quantized = cute.make_rmem_tensor((8,), cutlass.Float8E4M3FN)
                 quantized.store((values * inv_scale).to(cutlass.Float8E4M3FN))
@@ -1300,6 +1353,12 @@ def _mx_ptr(t, dtype=None, align=16):
 
 
 def mxfp8_quantize(a, *, k_multiple=256):
+    if a.ndim != 2 or a.dtype != torch.bfloat16:
+        raise ValueError('MXFP8 quantization requires a BF16 matrix')
+    transpose = a.stride(0) == 1 and a.stride(1) != 1
+    minor, major = (a.stride(0), a.stride(1)) if transpose else (a.stride(1), a.stride(0))
+    if minor != 1 or major % 8 or a.data_ptr() % 16:
+        raise ValueError('MXFP8 quantization requires 16-byte aligned rows or columns')
     rows, k = a.shape
     rp, kp = padded_rows(rows, MMA_TILER_MN[0]), padded_rows(k, k_multiple)
     q = torch.empty((rp, kp), device=a.device, dtype=torch.float8_e4m3fn)
@@ -1307,7 +1366,6 @@ def mxfp8_quantize(a, *, k_multiple=256):
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     args = (_mx_ptr(a), _mx_ptr(q), _mx_ptr(sf), Int32(rows), Int32(k), Int32(rp), Int32(kp),
             Int32(a.stride(0)), Int32(a.stride(1)))
-    transpose = a.stride(0) == 1 and a.stride(1) != 1
     key = ('quantize', a.dtype, transpose)
     if key not in _mx_compiled:
         _mx_compiled[key] = cute.compile(_mx_quant_launch, *args, transpose, stream)
@@ -1335,19 +1393,21 @@ def require_native_mxfp8(compiled):
 
 
 def mxfp8_wgrad(dy, x, out, *, accumulate=False):
+    if accumulate and out.dtype != torch.float32:
+        raise ValueError('MXFP8 gradient accumulation requires FP32 output')
     dq, ds = mxfp8_quantize(dy.T)
     xq, xs = mxfp8_quantize(x.T)
-    result = torch.empty_like(out) if accumulate else out
     dummy = torch.empty(1, dtype=torch.int64, device=out.device)
-    args = (_mx_ptr(dq), _mx_ptr(xq), _mx_ptr(result), _mx_ptr(result),
+    args = (_mx_ptr(dq), _mx_ptr(xq), _mx_ptr(out), _mx_ptr(out),
             *(_mx_ptr(dummy, align=8) for _ in range(5)),
             *(Int64(0) for _ in range(4)), Int32(dq.shape[0]),
             (_mx_ptr(ds, cutlass.Float8E8M0FNU), _mx_ptr(xs, cutlass.Float8E8M0FNU)))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    key = ('wgrad', tuple(dq.shape), tuple(xq.shape), tuple(out.shape), out.dtype, out.device.index)
+    key = ('wgrad', tuple(dq.shape), tuple(xq.shape), tuple(out.shape), out.dtype, out.device.index, accumulate)
     if key not in _mx_compiled:
         op = UlyssesGemm('local', 1, 0, 0, 1, 128, mxfp8_tile_n('local', out.shape[1]))
         op.mxfp8 = True
+        op.accumulate = accumulate
         # B's allocated rows include quantizer padding, not extra output columns.
         op.a_shape, op.b_shape, op.c_shape = tuple(dq.shape), (out.shape[1], xq.shape[1]), tuple(out.shape)
         op.a_rows = dq.shape[0]
@@ -1355,8 +1415,6 @@ def mxfp8_wgrad(dy, x, out, *, accumulate=False):
         _mx_compiled[key] = compile_mxfp8(op, *args, clusters, stream)
     compiled = _mx_compiled[key]
     compiled(*args, stream)
-    if accumulate:
-        out.add_(result)
     return compiled
 
 
