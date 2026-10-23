@@ -201,3 +201,58 @@ def interleave_qkv_rows(segment_major, heads, head_dim):
     shape = segment_major.shape[1:]
     per_head = segment_major.reshape((segments, heads, head_dim) + shape).transpose(0, 1)
     return per_head.reshape(segment_major.shape)
+
+
+def quantize_mxfp8(x):
+    """Independent quantize/dequantize oracle; never used for benchmark timing."""
+    shape = x.shape
+    groups = F.pad(x.double(), (0, -shape[1] % 32)).reshape(shape[0], -1, 32)
+    peak = groups.abs().amax(-1, keepdim=True)
+    exponent = torch.ceil(torch.log2(peak / 448))
+    # Correct log2 rounding at exact power-of-two scale boundaries.
+    exponent = torch.where(peak <= 224 * torch.exp2(exponent), exponent - 1, exponent)
+    exponent = torch.where(peak > 448 * torch.exp2(exponent), exponent + 1, exponent)
+    exponent = torch.where(peak == 0, 0, exponent).clamp(-126, 127)
+    scale = torch.where(torch.isinf(peak), float('nan'), torch.exp2(exponent))
+    payload = (groups / scale).to(torch.float8_e4m3fn).float()
+    return (payload * scale.float()).reshape(shape[0], -1)[:, :shape[1]]
+
+
+def mxfp8_mm(a, b):
+    return quantize_mxfp8(a) @ quantize_mxfp8(b.T).T
+
+
+@torch.no_grad()
+def mxfp8_projections(x, grads, o, dy, qkv_weight, out_weight, qkv_bias=None, out_bias=None,
+                     *, heads, bias_in_gemm=False):
+    """Local quantized GEMMs plus gathered BF16 transport, independent of CuTe.
+
+    Wgrad requantizes each rank's reduction axis before gradient reduction.
+    Returned weight/bias gradients are FP32 rank-local contributions.
+    """
+    p, rank = dist.get_world_size(), dist.get_rank()
+    m, h = x.shape
+    d, segments = h // heads, len(grads)
+    head_slice = slice(rank * (heads // p), (rank + 1) * (heads // p))
+    rows = slice(rank * m, (rank + 1) * m)
+
+    def gather(tensor, dim):
+        parts = [torch.empty_like(tensor) for _ in range(p)]
+        dist.all_gather(parts, tensor.contiguous())
+        return torch.cat(parts, dim=dim)
+
+    raw = mxfp8_mm(x, qkv_weight.T)
+    if qkv_bias is not None:
+        raw = (raw if bias_in_gemm else raw.to(x.dtype).float()) + qkv_bias.float()
+    packed = gather(raw.to(x.dtype), 0).view(p * m, heads, segments, d)
+    qs = tuple(packed[:, head_slice, s].contiguous() for s in range(segments))
+    grad = gather(torch.stack(grads, dim=2), 1).reshape(p * m, segments * h)[rows]
+    dx, dwq = mxfp8_mm(grad, qkv_weight).to(x.dtype), mxfp8_mm(grad.T, x)
+    oseq = gather(o, 1).flatten(1)[rows]
+    y = mxfp8_mm(oseq, out_weight.T).to(o.dtype)
+    if out_bias is not None:
+        y = y + out_bias
+    full_do = gather(mxfp8_mm(dy, out_weight).to(o.dtype), 0).view(p * m, heads, d)
+    return dict(qkv=qs, dx=dx, dwq=dwq, dbq=grad.float().sum(0), y=y,
+                do=full_do[:, head_slice].contiguous(), dwo=mxfp8_mm(dy.T, oseq),
+                dbo=dy.float().sum(0))

@@ -3,8 +3,10 @@
 All implementations share the same weight values. The QKV projection and the output
 projection are tested independently with their own random inputs and output
 gradients; every forward output and gradient of both implementations is compared
-with the same computation on all T tokens. Timing reports forward and backward
-MFU of each part for the reference and the fused modules, writes JSON to --output,
+with an independent reference. MXFP8 checks quantized GEMMs per rank, including
+requantization along each backward reduction axis. The timed async reference
+remains BF16. Timing reports forward and backward MFU of each part for the
+reference and the fused modules, writes JSON to --output,
 and records a torch profiler trace per rank next to it.
 """
 import argparse
@@ -26,7 +28,7 @@ from torch.profiler import ProfilerActivity, profile, schedule
 from benchmark.common import BenchmarkRuntime, capture_profile_stage, profile_stage
 from fused_gemm_a2a import FusedGemmA2AWorkspace, FusedOutputProjection, FusedQKVProjection, MMA_TILER_MN
 from benchmark.reference import UlyssesOutputProjection, UlyssesQKVProjection
-from benchmark.reference import interleave_qkv_rows
+from benchmark.reference import interleave_qkv_rows, mxfp8_projections
 from fused_gemm_a2a_kernels import padded_rows
 
 
@@ -48,7 +50,11 @@ def main():
     p.add_argument('--output', default='results/fused.json')
     p.add_argument('--profile', action='store_true',
                    help='Trace each operator in its selected eager/CUDA Graph timing mode')
-    p.add_argument('--peak-tflops', type=float, default=2500)
+    p.add_argument('--precision', choices=('bf16', 'mxfp8'), default='bf16',
+                   help='Fused GEMM precision; the async reference remains BF16')
+    p.add_argument('--peak-tflops', type=float, default=2500, help='BF16 dense peak TFLOPS per GPU')
+    p.add_argument('--mxfp8-peak-tflops', type=float, default=5000,
+                   help='Native MXFP8 dense peak TFLOPS per GPU')
     p.add_argument('--gate', action='store_true',
                    help='Fourth projection of width H (the DiT VSA coarse gate): the fused module runs four '
                         'segments, the reference overlaps four separate GEMMs and asynchronous all-to-alls')
@@ -63,6 +69,10 @@ def main():
     a = p.parse_args()
     if a.bias_in_gemm and not a.bias:
         p.error('--bias-in-gemm requires --bias')
+    if a.precision == 'mxfp8' and a.hidden_size != 128 * a.heads:
+        p.error('--precision mxfp8 requires head_dim=128')
+    if a.peak_tflops <= 0 or a.mxfp8_peak_tflops <= 0:
+        p.error('peak TFLOPS must be positive')
     runtime = BenchmarkRuntime(a, p, collect_failures=True)
     device, capture_stream = runtime.device, runtime.capture_stream
     dtype, ref_dtype, tol = torch.bfloat16, runtime.ref_dtype, runtime.tolerance
@@ -84,7 +94,8 @@ def main():
                                       gate=a.gate)
         ref_out = UlyssesOutputProjection(H, heads, bias=a.bias, device=device, dtype=dtype)
         segments = 3 + a.gate
-        workspace = FusedGemmA2AWorkspace(H, heads, M if a.max_local_tokens is None else a.max_local_tokens, gate=a.gate)
+        workspace = FusedGemmA2AWorkspace(H, heads, M if a.max_local_tokens is None else a.max_local_tokens,
+                                         gate=a.gate, precision=a.precision)
         def to_fused_rows(seg_major):
             return interleave_qkv_rows(seg_major, heads, D)
 
@@ -102,6 +113,11 @@ def main():
             return modules
 
         fused_qkv, fused_out = make_fused(ref_qkv, ref_out)
+
+        def quantized_reference(qkv, proj, x, grads, o, dy):
+            return mxfp8_projections(x, grads, o, dy, qkv.weight, proj.weight, qkv.bias, proj.bias,
+                                     heads=heads, bias_in_gemm=a.bias_in_gemm)
+
         ref_qkv_weights = [proj.weight for proj in ref_qkv.projections]
         ref_qkv_biases = [proj.bias for proj in ref_qkv.projections] if a.bias else []
         ref_qkv_params = ref_qkv_weights + ref_qkv_biases
@@ -129,7 +145,8 @@ def main():
         grads_f = grads_ref
         log(f'CP={P} | {dtype} | x={tuple(x.shape)} | heads={heads} kv_heads={kv_heads} head_dim={D} | '
             f'internal rows per rank={Mc} | segments={segments} '
-            '| rows=Megatron')
+            f'| rows=Megatron | fused={a.precision} reference=bf16')
+        mx = quantized_reference(fused_qkv, fused_out, x, grads_ref, o, gy) if a.precision == 'mxfp8' else None
 
         # QKV projection: full-token reference, then both implementations.
         X = gather(x, 0).requires_grad_()
@@ -150,9 +167,13 @@ def main():
         for name, (outs, xr_, dw, expected_dw) in dict(
                 reference=(ref_outs, xr, torch.cat([reduced(w.grad) for w in ref_qkv_weights]), dW_qkv),
                 fused=(fused_outs, xf, reduced(fused_qkv.weight.grad), to_fused_rows(dW_qkv))).items():
-            for label, actual, expected in zip(labels, outs, full):
-                check(actual, expected[:, hq], f'{name} {label}')
-            check(xr_.grad, X.grad[rows], f'{name} dx')
+            expected_outs, expected_dx = [t[:, hq] for t in full], X.grad[rows]
+            if name == 'fused' and mx is not None:
+                expected_outs, expected_dx = mx['qkv'], mx['dx']
+                expected_dw = reduced(mx['dwq'].to(dtype))
+            for label, actual, expected in zip(labels, outs, expected_outs):
+                check(actual, expected, f'{name} {label}')
+            check(xr_.grad, expected_dx, f'{name} dx')
             check(dw, expected_dw, f'{name} dW_qkv (CP-reduced)')
         if a.bias:
             check(torch.cat([reduced(b.grad) for b in ref_qkv_biases]), dB_qkv, 'reference dbias_qkv (CP-reduced)')
@@ -173,13 +194,16 @@ def main():
         torch.autograd.backward(yf, gy, retain_graph=True)
         for name, (y_, do, dw) in dict(reference=(y, orr.grad, reduced(ref_out.o_proj.weight.grad)),
                                      fused=(yf, of.grad.clone(), reduced(fused_out.weight.grad))).items():
-            check(y_, Y[rows], f'{name} y')
-            check(do, O.grad[:, hq], f'{name} do')
-            check(dw, Wo.grad, f'{name} dW_o (CP-reduced)')
+            expected_y, expected_do, expected_dw = Y[rows], O.grad[:, hq], Wo.grad
+            if name == 'fused' and mx is not None:
+                expected_y, expected_do, expected_dw = mx['y'], mx['do'], reduced(mx['dwo'].to(dtype))
+            check(y_, expected_y, f'{name} y')
+            check(do, expected_do, f'{name} do')
+            check(dw, expected_dw, f'{name} dW_o (CP-reduced)')
         if a.bias:
             check(reduced(ref_out.o_proj.bias.grad), Bo.grad, 'reference dbias_o (CP-reduced)')
             check(reduced(fused_out.bias.grad), Bo.grad, 'fused dbias_o (CP-reduced)')
-        del O, Y, Wo
+        del O, Y, Wo, mx
         if failures:
             raise RuntimeError(f'Validation failed for: {failures}')
 
@@ -224,7 +248,12 @@ def main():
             else:
                 replay_graph.replay()
                 actuals = replay_outputs
-            expecteds = full_step(ref_qkv, ref_out)
+            if a.precision == 'mxfp8':
+                expected = quantized_reference(fused_qkv, fused_out, sx, sg[:ng], so, sg[ng])
+                expecteds = (*expected['qkv'], expected['dx'], expected['dwq'].to(dtype),
+                             expected['y'], expected['do'], expected['dwo'].to(dtype))
+            else:
+                expecteds = full_step(ref_qkv, ref_out)
             for label, actual, expected in zip((*labels, 'dx', 'dW_qkv', 'y', 'do', 'dW_o'), actuals, expecteds):
                 check(actual, expected, f'changed inputs round {round_} {label}')
         if failures:
@@ -269,14 +298,21 @@ def main():
             for li in range(a.layers):
                 rq, ro, fq, fo, ws = layers[li]
                 (xr_, outs_r, or_, yr_), (xf_, outs_f, of_, yf_) = runs[False][li], runs[True][li]
+                expected_dx, expected_do = xr_.grad, or_.grad
+                expected_dwq = to_fused_rows(torch.cat([reduced(w.grad) for w in ws]))
+                expected_dwo = reduced(ro.o_proj.weight.grad)
+                if a.precision == 'mxfp8':
+                    expected = quantized_reference(fq, fo, x, grads_ref, o, gy)
+                    outs_r, yr_ = expected['qkv'], expected['y']
+                    expected_dx, expected_do = expected['dx'], expected['do']
+                    expected_dwq, expected_dwo = (reduced(expected[key].to(dtype)) for key in ('dwq', 'dwo'))
                 for label, af, ar in zip(labels, outs_f, outs_r):
                     check(af, ar, f'layers L{li} {label}')
-                check(xf_.grad, xr_.grad, f'layers L{li} dx')
-                check(reduced(fq.weight.grad), to_fused_rows(torch.cat([reduced(w.grad) for w in ws])),
-                      f'layers L{li} dW_qkv')
+                check(xf_.grad, expected_dx, f'layers L{li} dx')
+                check(reduced(fq.weight.grad), expected_dwq, f'layers L{li} dW_qkv')
                 check(yf_, yr_, f'layers L{li} y')
-                check(of_.grad, or_.grad, f'layers L{li} do')
-                check(reduced(fo.weight.grad), reduced(ro.o_proj.weight.grad), f'layers L{li} dW_o')
+                check(of_.grad, expected_do, f'layers L{li} do')
+                check(reduced(fo.weight.grad), expected_dwo, f'layers L{li} dW_o')
             if failures:
                 raise RuntimeError(f'Validation failed for: {failures}')
             del layers, runs
@@ -322,6 +358,15 @@ def main():
                       timed_invocations=(math.ceil(a.iterations / a.graph_batch) * a.graph_batch
                                          if a.cuda_graphs else a.iterations),
                       validation_max_relative_error=errors, tolerance=tol, **timings)
+        result['precision'] = dict(reference='bf16', fused=a.precision)
+        result['peak_tflops_per_gpu'] = dict(
+            reference=a.peak_tflops, fused=a.mxfp8_peak_tflops if a.precision == 'mxfp8' else a.peak_tflops)
+        if a.precision == 'mxfp8':
+            kernels = fused_gemm_a2a_kernels._native_mxfp8_kernels
+            result['native_block_scaled_mma'] = bool(kernels) and all(
+                'tcgen05.mma' in k.__ptx__ and 'block_scale' in k.__ptx__ for k in kernels)
+            if not result['native_block_scaled_mma']:
+                raise RuntimeError('Native MXFP8 block-scaled MMA missing')
         result['timing_execution'] = {}
         for name, _ in stages:
             use_graph = a.cuda_graphs
@@ -329,7 +374,7 @@ def main():
                 mode='cuda_graph' if use_graph else 'eager',
                 invocations=math.ceil(a.iterations / a.graph_batch) * a.graph_batch
                 if use_graph else a.iterations)
-        table = ['| part | async reference | fused | speedup |',
+        table = [f'| part | async reference (bf16) | fused ({a.precision}) | speedup |',
                  '| --- | ---: | ---: | ---: |']
         for part in ('qkv', 'out'):
             for direction, factor in (('forward', 1), ('backward', 2)):
@@ -337,7 +382,7 @@ def main():
                 for impl in ('reference', 'fused'):
                     us = timings[f'{impl}_{part}_{direction}_us']
                     tflops = factor * flops[part] / (us * 1e6)
-                    mfu = tflops / a.peak_tflops
+                    mfu = tflops / result['peak_tflops_per_gpu'][impl]
                     result[f'{impl}_{part}_{direction}_tflops'] = tflops
                     result[f'{impl}_{part}_{direction}_mfu'] = mfu
                     cells.append(f'{us:.1f} us, {tflops:.1f} TFLOPS, MFU {100 * mfu:.1f}%')

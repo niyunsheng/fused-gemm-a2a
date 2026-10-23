@@ -20,28 +20,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from fused_gemm_a2a import FusedGemmA2AWorkspace, FusedQKVProjection, FusedOutputProjection
 from fused_gemm_a2a_kernels import mxfp8_wgrad
-
-
-def quantized(x):
-    shape = x.shape
-    x = F.pad(x.float(), (0, -shape[-1] % 32))
-    groups = x.reshape(x.shape[0], -1, 32)
-    peak = groups.abs().amax(-1, keepdim=True)
-    exponent = torch.ceil(torch.log2(peak.clamp_min(2.0 ** -120) / 448.0)).clamp(-126, 127)
-    exponent = torch.where(peak == 0, 0.0, exponent)
-    scale = torch.exp2(exponent)
-    payload = (groups / scale).clamp(-448, 448).to(torch.float8_e4m3fn).float()
-    return (payload * scale).reshape(x.shape)[:, :shape[-1]]
-
-
-def mm(a, b):
-    return quantized(a) @ quantized(b.T).T
-
-
-def gather(x):
-    parts = [torch.empty_like(x) for _ in range(dist.get_world_size())]
-    dist.all_gather(parts, x.contiguous())
-    return parts
+from benchmark.reference import mxfp8_mm, mxfp8_projections
 
 
 def main():
@@ -124,25 +103,12 @@ def main():
                 def reference():
                     heads, ys, dxs, dos, dwqs, dwos, dbqs, dbos = [], [], [], [], [], [], [], []
                     for x, g, o, dy in zip(xs, gs, os_, dys):
-                        raw = mm(x.detach(), wq.detach().T)
-                        if bq is not None:
-                            raw = (raw if bias_mode == 'pre' else raw.to(torch.bfloat16).float()) + bq.float()
-                        packed = torch.cat(gather(raw.to(torch.bfloat16))).view(p*m, args.heads, segments, d)
-                        heads.append(tuple(packed[:, rank*(args.heads//p):(rank+1)*(args.heads//p), s].contiguous() for s in range(segments)))
-                        parts = gather(torch.stack(g, dim=2))
-                        full_dy = torch.cat(parts, dim=1).reshape(p*m, segments*h)[rank*m:(rank+1)*m]
-                        dxs.append(mm(full_dy, wq.detach()).to(torch.bfloat16))
-                        dwqs.append(mm(full_dy.T, x.detach()))
-                        dbqs.append(full_dy.float().sum(0))
-                        oseq = torch.cat(gather(o.detach()), dim=1).flatten(1)[rank*m:(rank+1)*m]
-                        y = mm(oseq, wo.detach().T).to(torch.bfloat16)
-                        if bo is not None:
-                            y = y + bo
-                        ys.append(y)
-                        full_dx = torch.cat(gather(mm(dy, wo.detach()).to(torch.bfloat16)))
-                        dos.append(full_dx.view(p*m, args.heads, d)[:, rank*(args.heads//p):(rank+1)*(args.heads//p)].contiguous())
-                        dwos.append(mm(dy.T, oseq))
-                        dbos.append(dy.float().sum(0))
+                        expected = mxfp8_projections(
+                            x, g, o, dy, wq, wo, bq, bo, heads=args.heads,
+                            bias_in_gemm=bias_mode == 'pre')
+                        for values, key in ((heads, 'qkv'), (ys, 'y'), (dxs, 'dx'), (dos, 'do'),
+                                            (dwqs, 'dwq'), (dwos, 'dwo'), (dbqs, 'dbq'), (dbos, 'dbo')):
+                            values.append(expected[key])
                     def total(values):
                         if accumulate:
                             return values[1] + values[0]
@@ -205,7 +171,7 @@ def main():
             out = torch.empty(width, width, device=device, dtype=torch.float32)
             for _ in range(3):
                 mxfp8_wgrad(dy, x, out)
-            check(out, quantized(dy.T) @ quantized(x.T).T, f'local/{width}/{tokens}/eager')
+            check(out, mxfp8_mm(dy.T, x), f'local/{width}/{tokens}/eager')
             if not args.skip_graphs:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream):
@@ -214,7 +180,7 @@ def main():
                     dy.normal_()
                     x.normal_()
                     graph.replay()
-                    check(out, quantized(dy.T) @ quantized(x.T).T,
+                    check(out, mxfp8_mm(dy.T, x),
                           f'local/{width}/{tokens}/graph{replay}')
                 graph.reset()
     # Exhaust the finite BF16 magnitudes at the quantization boundary. Each

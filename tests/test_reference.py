@@ -18,6 +18,25 @@ def local_a2a(x, scatter_dim, gather_dim, group, async_op=False):
 
 
 class ReferenceTest(unittest.TestCase):
+    def test_mxfp8_scale_boundary_and_tail(self):
+        x = torch.zeros(3, 33, dtype=torch.bfloat16)
+        x[0, 0], x[1, 0] = 448, 450
+        x[:2, 1] = 2.0 ** -9
+        x[:, 32] = 2.0 ** -133
+        expected = x.float()
+        expected[1, 0], expected[1, 1] = 448, 0
+        # Crossing 448 doubles the scale: a minimum E4M3 subnormal now
+        # rounds to zero. The final column belongs to its own padded group.
+        torch.testing.assert_close(reference.quantize_mxfp8(x), expected, rtol=0, atol=0)
+
+    def test_mxfp8_oracle_preserves_nonfinite_inputs(self):
+        for value in (float('inf'), -float('inf'), float('nan')):
+            x = torch.ones(2, 32, dtype=torch.bfloat16)
+            x[0, 0] = value
+            got = reference.quantize_mxfp8(x)
+            self.assertFalse(torch.isfinite(got[0, 0]))
+            torch.testing.assert_close(got[1], torch.ones(32), rtol=0, atol=0)
+
     def make_module(self, gate, bias, kv_heads=4):
         with patch.object(reference.dist, 'get_world_size', return_value=1):
             return reference.UlyssesQKVProjection(

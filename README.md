@@ -1,11 +1,9 @@
 # Fused GEMM + All-to-All
 
 Fused projection GEMMs and Ulysses all-to-all, with backward, for BF16 MHA
-training on NVLink-connected GB200 (SM100) GPUs.
+training on NVLink-connected GB200 (SM100) GPUs. MXFP8 GEMMs are opt-in;
+BF16 remains the default.
 **GQA is not supported yet.**
-
-An opt-in experimental MXFP8 path is also available. It is not part of the
-v0.1.0 release; BF16 remains the default.
 
 ## How it works
 
@@ -51,7 +49,7 @@ Import from the checkout, or copy these two files into your project.
 | File | Purpose |
 | --- | --- |
 | `fused_gemm_a2a.py` | Public workspace, projections and autograd |
-| `fused_gemm_a2a_kernels.py` | CuTe GEMMs, peer transport, MXFP8 conversion and auxiliary kernels |
+| `fused_gemm_a2a_kernels.py` | CuTe GEMMs, peer transport, quantization, copies/reductions and tile geometry |
 
 ## API
 
@@ -92,51 +90,23 @@ y.backward(grad_y)
 
 Parameter gradients are rank-local; the trainer handles CP/DP gradient reduction.
 
-### Experimental MXFP8
+### MXFP8
 
-Select the GEMM precision on the workspace; projection calls stay the same.
+Set `precision="mxfp8"` on `FusedGemmA2AWorkspace` to use native SM100
+block-scaled GEMMs for forward, dgrad and wgrad. Projection calls, master
+weights, activation interfaces and all-to-all transport remain BF16.
 
-```python
-workspace = FusedGemmA2AWorkspace(
-    H, N, max_local_tokens=M_max, cp_group=cp_group,
-    gate=True, precision="mxfp8",
-)
-q, k, v, gate = qkvg(x, workspace)
-y = proj(vsa(q, k, v, gate), workspace)
-y.backward(grad_y)
-```
+Each GEMM independently quantizes its reduction axis to E4M3 with one E8M0
+scale per 32 elements and FP32 accumulation. Scales use
+`ceil(log2(amax / 448))`, clamped to [-126, 127]; zero groups use scale 1.
+Inf groups use NaN scales so overflow remains visible. Inputs and weights
+are requantized on each call, including CUDA Graph replay. This policy is
+validated against independent quantized math, not bitwise TE equivalence.
 
-Forward, input-gradient and weight-gradient GEMMs use native SM100 MXFP8
-instructions with FP32 accumulation. Each operand is independently quantized
-to E4M3 along its reduction axis, with an E8M0 scale per 32 values. Scales use
-`ceil(log2(amax / 448))`; this policy is not a bitwise TE compatibility claim.
-
-Inputs, outputs and caller-owned master weights remain BF16.
-The path requires `D=128` and supports optional bias and FP32 `main_grad`
-accumulation. TE quantized Parameter subclasses are not accepted yet.
-Quantization runs on every invocation, including CUDA Graph replay after
-weight updates. QKV/output-gradient tiles are sent as BF16. Receive GEMMs
-use the same CuTe persistent GEMM and receive-pusher pipeline as BF16.
-Pusher warps transfer only BF16. Dedicated receiver warps quantize completed
-blocks into local FP8/scale buffers; TMA waits for quantization before MMA.
-The original BF16 operands remain available for backward. Communication and
-quantization overlap with GEMM inside the persistent kernel.
-MXFP8 quantization, row copies and bias reductions also use CuTe DSL.
-The BF16 path retains its existing Triton copies and reductions.
-
-```bash
-torchrun --standalone --nproc-per-node=4 tests/mxfp8_driver.py \
-  --lengths 1 33 1153 --output results/mxfp8-parity.json
-torchrun --standalone --nproc-per-node=4 benchmark/mxfp8.py \
-  --cp 4 --gate --tokens 131072 --output results/mxfp8-timing.json
-```
-
-Timing includes quantization. Results report native MFU using 2500 TFLOPS
-for BF16 and 5000 TFLOPS for MXFP8, plus BF16-equivalent MFU in the JSON output.
-Use `--main-grad --qkv-bias-only --bias-in-gemm` instead of `--bias` to measure
-FP32 gradient accumulation with DiT-style bias placement. The wgrad epilogue
-updates `main_grad` directly. See [MXFP8 design and validation](docs/mxfp8.md)
-for the numerical contract and focused GPU checks.
+MXFP8 requires `D=128` and BF16 master weights; TE quantized Parameter
+subclasses are not supported. Optional weight `main_grad` buffers must match
+the weight shape/device, use contiguous FP32 storage and be 16-byte aligned.
+Wgrad accumulates directly into these buffers.
 
 ## Execution constraints
 
@@ -190,38 +160,22 @@ torchrun --standalone --nproc-per-node=4 benchmark/run.py \
 
 Add `--gate` for QKVG and `--profile` for Torch traces. For CP8/CP16, use
 multi-node torchrun on 2/4 four-GPU nodes with matching `--cp`.
+Use the same command with `--precision mxfp8` to measure MXFP8. The timed
+Async Ulysses reference stays BF16; fused numerical checks use independent
+MXFP8 math, including backward requantization and changed-input graph replay.
+JSON retains the same timing fields and records each implementation's precision.
+MFU uses `--peak-tflops` (default 2500) for BF16 and `--mxfp8-peak-tflops`
+(default 5000) for MXFP8. These are projection measurements, not training MFU.
+
 CPU checks: `python -m unittest discover -s tests`.
 
-### Experimental MXFP8 status
+MXFP8 quantization, FP32 accumulation and distributed numerical regressions:
 
-Implementation `6b09fbf` passes 678 independent quantized-reference
-comparisons at each of CP3/CP8/CP16, 480 BF16 regression comparisons at
-each of CP8/CP16, exhaustive finite-BF16 byte parity, 76 exact FP32
-accumulation checks and 21 unit tests.
-
-Review corrections in `48eb2de` preserve nonfinite inputs through quantization
-and validate caller-owned `main_grad` buffers before wgrad. They pass 25 unit
-tests and the same finite/distributed regressions, plus nonfinite and graph
-replay checks. See [review validation](docs/mxfp8.md#review-corrections-2026-10-22).
-The performance table below records the earlier `6b09fbf` implementation.
-
-GB200 · PyTorch 26.04 · CUDA 13.2 · CUTLASS DSL 4.6.2 · H4096 ·
-QKVG + output · FP32 `main_grad` · QKVG-only bias before BF16 rounding ·
-CUDA Graphs. BF16 wgrad uses the default `torch` backend. Pairs below are
-**forward / backward**, averaging both precision-order medians.
-
-| CP | Tokens | BF16 ms | MXFP8 ms | Speedup | Native MXFP8 MFU |
-|---:|---:|---:|---:|---:|---:|
-| 8 | 131,072 | 2.375 / 4.780 | 1.826 / 3.608 | 1.30x / 1.32x | 30.11% / 30.47% |
-| 8 | 119,296 | 2.525 / 4.479 | 1.706 / 3.320 | 1.48x / 1.35x | 29.33% / 30.14% |
-| 16 | 131,072 | 1.224 / 2.566 | 1.016 / 2.087 | 1.21x / 1.23x | 27.06% / 26.34% |
-| 16 | 119,296 | 1.269 / 2.450 | 0.981 / 1.904 | 1.29x / 1.29x | 25.51% / 26.27% |
-
-Native MXFP8 MFU uses 5000 TFLOPS/GPU; BF16-equivalent MFU is twice
-these percentages. This is a projection benchmark, not training MFU or
-convergence evidence. See [the paired results](docs/mxfp8.md#paired-performance-results-2026-10-22)
-for historical bias-mode timings, comparison against `85d1ecc`, source
-hashes and reproduction commands. MXFP8 remains opt-in.
+```bash
+python tests/mxfp8_local_driver.py --output results/mxfp8-local.json
+torchrun --standalone --nproc-per-node=4 tests/mxfp8_driver.py \
+  --lengths 1 33 1153 --output results/mxfp8-parity.json
+```
 
 ## License
 
