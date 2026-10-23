@@ -199,6 +199,12 @@ comparisons at each of CP3/CP8/CP16, 480 BF16 regression comparisons at
 each of CP8/CP16, exhaustive finite-BF16 byte parity, 76 exact FP32
 accumulation checks and 21 unit tests.
 
+Review corrections in `48eb2de` preserve nonfinite inputs through quantization
+and validate caller-owned `main_grad` buffers before wgrad. They pass 25 unit
+tests and the same finite/distributed regressions, plus nonfinite and graph
+replay checks. See [review validation](docs/mxfp8.md#review-corrections-2026-10-22).
+The performance table below records the earlier `6b09fbf` implementation.
+
 GB200 · PyTorch 26.04 · CUDA 13.2 · CUTLASS DSL 4.6.2 · H4096 ·
 QKVG + output · FP32 `main_grad` · QKVG-only bias before BF16 rounding ·
 CUDA Graphs. BF16 wgrad uses the default `torch` backend. Pairs below are

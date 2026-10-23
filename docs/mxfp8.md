@@ -155,3 +155,47 @@ the displayed percentage. Timings are uninstrumented. A separate CP8
 trace confirms that the MXFP8 wgrad path has no separate dW-add kernel.
 
 [Machine-readable results and source hashes](mxfp8-results-20261022.json).
+
+## Review corrections (2026-10-22)
+
+Review of `f795546` reproduced two correctness issues, fixed in `48eb2de`:
+
+- A 384x128 parameter accepted a 128x128 `main_grad`, silently computing a
+  truncated gradient while returning a full-size dummy. Exact shape/device,
+  dtype, stride and alignment validation now rejects malformed buffers.
+- Inf quantized to finite E4M3 +/-448 with E8M0 byte 247. With the other
+  wgrad operand equal to 2^-64, the result was finite +/-3.22818e19. Inf
+  groups now use E8M0 NaN byte 255 in both standalone and receive paths.
+
+The review also restored the README's original license and attribution
+section, which had been accidentally replaced by the benchmark table.
+
+GB200 validation of the corrected production source passes 25 unit tests,
+eight exhaustive finite-BF16 byte cases, 76 exact FP32 accumulation checks
+and 22 standalone nonfinite checks. CP3/CP8/CP16 each pass 678 independent
+quantized-reference comparisons and eight nonfinite receive checks, including
+changed-input graph replay and finite recovery. Receive payload/scale bytes
+match the standalone quantizer for finite and nonfinite cases. CP8/CP16 each
+also pass 480 BF16 regression comparisons. Native block-scaled MMA remains
+required. These tests do not establish full-model convergence.
+
+[Review validation and source hashes](mxfp8-review-20261022.json).
+
+Paired training-style timing compares `48eb2de` with pre-review `f795546`
+on the same allocation per CP size. The environment, shapes and timing
+settings match the training rows above: both precision orders, seven trials,
+128 iterations, ten warmups and graph batch eight. All 16 timing files pass
+source-hash, configuration and native-MMA checks. Pairs are forward / backward.
+
+| CP | Tokens | Corrected MXFP8 ms | Latency change vs f795546 | Speedup / BF16 | Native MXFP8 MFU |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 131,072 | 1.839 / 3.617 | +0.16% / -0.13% | 1.31x / 1.33x | 29.90% / 30.40% |
+| 8 | 119,296 | 1.712 / 3.345 | -0.19% / +0.15% | 1.48x / 1.35x | 29.23% / 29.91% |
+| 16 | 131,072 | 1.021 / 2.079 | +0.13% / -0.55% | 1.20x / 1.24x | 26.93% / 26.45% |
+| 16 | 119,296 | 0.984 / 1.910 | +0.16% / -0.40% | 1.30x / 1.28x | 25.42% / 26.19% |
+
+Maximum absolute BF16 aggregate control drift is 0.27%. The largest MXFP8
+latency increase is 0.16%, within that variability; these measurements show
+no material regression from the correctness fixes. Native MXFP8 MFU uses
+5000 TFLOPS/GPU and covers projections only. Historical-mode timing was not
+repeated for this correction; its earlier measurements remain above.
