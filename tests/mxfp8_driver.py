@@ -1,8 +1,6 @@
-"""Independent quantized-math parity, workspace lifetime and graph replay.
+"""Native PyTorch MXFP8 parity, workspace lifetime and graph replay.
 
-Reference: OCP block-scaled product used by CUTLASS MXF8 GEMM:
-https://github.com/NVIDIA/cutlass/blob/v4.5.0/examples/python/CuTeDSL/cute/blackwell/kernel/blockscaled_gemm/dense_blockscaled_gemm_persistent.py
-Use E4M3, 32 reduction elements per E8M0 scale, ceiling scale selection.
+Use torch.nn.functional.scaled_mm on the same E4M3/E8M0 operands as CuTe.
 Backward requantizes each operand along the new reduction axis; it does not
 transpose an already quantized payload or differentiate quantization itself.
 """
@@ -251,6 +249,8 @@ def main():
     if rank == 0:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(dict(cp=p, heads=args.heads, lengths=args.lengths,
+                                              torch=torch.__version__,
+                                              validation_gemm='torch.nn.functional.scaled_mm',
                                               native_block_scaled_mma=True,
                                               receive_quantization_byte_exact=True,
                                               exhaustive_bf16_scale_parity=True,

@@ -3,7 +3,7 @@
 All implementations share the same weight values. The QKV projection and the output
 projection are tested independently with their own random inputs and output
 gradients; every forward output and gradient of both implementations is compared
-with an independent reference. MXFP8 checks quantized GEMMs per rank, including
+with a reference. MXFP8 uses native PyTorch scaled_mm per rank, including
 requantization along each backward reduction axis. The timed async reference
 remains BF16. Timing reports forward and backward MFU of each part for the
 reference and the fused modules, writes JSON to --output,
@@ -359,6 +359,7 @@ def main():
                                          if a.cuda_graphs else a.iterations),
                       validation_max_relative_error=errors, tolerance=tol, **timings)
         result['precision'] = dict(reference='bf16', fused=a.precision)
+        result['validation_gemm'] = 'torch.nn.functional.scaled_mm' if a.precision == 'mxfp8' else 'torch.matmul'
         result['peak_tflops_per_gpu'] = dict(
             reference=a.peak_tflops, fused=a.mxfp8_peak_tflops if a.precision == 'mxfp8' else a.peak_tflops)
         if a.precision == 'mxfp8':

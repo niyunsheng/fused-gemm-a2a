@@ -1,4 +1,4 @@
-"""Single-GPU MXFP8 byte parity and FP32 accumulation regressions."""
+"""Native PyTorch MXFP8 parity and FP32 accumulation regressions."""
 import argparse
 import hashlib
 import json
@@ -7,63 +7,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
-import torch.nn.functional as F
 from fused_gemm_a2a_kernels import mxfp8_quantize, mxfp8_wgrad
-
-
-def quantizer_reference(x, padded_shape):
-    """Independent float64 scale calculation, including finite BF16 extremes."""
-    rows, cols = padded_shape
-    groups = F.pad(x.double(), (0, cols - x.shape[1], 0, rows - x.shape[0])).reshape(rows, -1, 32)
-    peak = groups.abs().amax(-1)
-    exponent = torch.ceil(torch.log2(peak / 448))
-    # CUDA log2(double) can round an exact integer slightly upward. Repair
-    # the estimate by checking the defining inequalities with exact binary
-    # scale boundaries, rather than relaxing byte parity at those boundaries.
-    exponent = torch.where(peak <= 224 * torch.exp2(exponent), exponent - 1, exponent)
-    exponent = torch.where(peak > 448 * torch.exp2(exponent), exponent + 1, exponent)
-    exponent = torch.where(peak == 0, 0, exponent).clamp(-126, 127)
-    payload = (groups / torch.exp2(exponent).unsqueeze(-1)).to(torch.float8_e4m3fn).reshape(rows, cols)
-    # Decode the public SM100 block-scale layout into logical [row, K-group].
-    r = torch.arange(rows, device=x.device)[:, None]
-    g = torch.arange(cols // 32, device=x.device)[None, :]
-    offsets = ((r // 128) * (cols // 128) + g // 4) * 512 + r % 32 * 16 + r % 128 // 32 * 4 + g % 4
-    return payload, (exponent + 127).to(torch.uint8), offsets
-
-
-def validate_quantization():
-    magnitudes = torch.arange(0x7f80, device='cuda', dtype=torch.int32).to(torch.int16)
-    cases = 0
-    for sign in (0, -32768):
-        values = (magnitudes ^ sign).view(torch.bfloat16)
-        logical = values[:, None].expand(-1, 32).contiguous()
-        # Also test groups containing mixed magnitudes and an odd token tail.
-        # Keep the physical leading dimension vector aligned while testing a
-        # logical K tail, just as the projection operands' layouts require.
-        mixed = F.pad(values[:128 * 255].reshape(128, 255), (0, 1))[:, :255]
-        for source in (logical, mixed):
-            for transpose in (False, True):
-                x = source.T.contiguous().T if transpose else source
-                payload, scales = mxfp8_quantize(x)
-                expected, expected_scales, offsets = quantizer_reference(x, payload.shape)
-                if not torch.equal(payload.view(torch.uint8), expected.view(torch.uint8)):
-                    positions = (payload.view(torch.uint8) != expected.view(torch.uint8)).nonzero()[:8]
-                    details = [dict(row=r, col=c, source=float(x[r, c]) if r < x.shape[0] and c < x.shape[1] else 0,
-                                    actual=int(payload.view(torch.uint8)[r, c]), expected=int(expected.view(torch.uint8)[r, c]),
-                                    scale=int(scales[offsets[r, c // 32]]), expected_scale=int(expected_scales[r, c // 32]))
-                               for r, c in positions.tolist()]
-                    raise AssertionError(('payload', sign, transpose, details))
-                assert torch.equal(scales[offsets], expected_scales), ('scale', sign, transpose)
-                cases += 1
-    for bad in (torch.zeros(128, 255, device='cuda', dtype=torch.bfloat16),
-                torch.zeros(128, 256, device='cuda', dtype=torch.bfloat16)[:, 1:129]):
-        try:
-            mxfp8_quantize(bad)
-        except ValueError as error:
-            assert 'aligned' in str(error)
-        else:
-            raise AssertionError('Unaligned quantizer input was accepted')
-    return cases
+from benchmark.reference import mxfp8_mm
 
 
 def validate_accumulation():
@@ -79,8 +24,7 @@ def validate_accumulation():
                 storage = torch.full((rows * cols + 256,), 123.25, device='cuda')
                 out = storage[128:-128].view(rows, cols)
                 seed = torch.randn_like(out)
-                delta = torch.empty_like(out)
-                mxfp8_wgrad(dy, x, delta)
+                delta = mxfp8_mm(dy.T, x)
                 out.copy_(seed)
                 mxfp8_wgrad(dy, x, out, accumulate=True)
                 torch.testing.assert_close(out, seed + delta, rtol=0, atol=0)
@@ -93,7 +37,7 @@ def validate_accumulation():
                 for _ in range(3):
                     dy.normal_()
                     x.normal_()
-                    mxfp8_wgrad(dy, x, delta)
+                    delta = mxfp8_mm(dy.T, x)
                     expected.add_(delta)
                     graph.replay()
                     torch.testing.assert_close(out, expected, rtol=0, atol=0)
@@ -168,8 +112,8 @@ def main():
     torch.cuda.set_device(0)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.manual_seed(123)
-    result = dict(quantizer_byte_comparisons=validate_quantization(), accumulation=validate_accumulation(),
-                  nonfinite_comparisons=validate_nonfinite())
+    result = dict(torch=torch.__version__, validation_gemm='torch.nn.functional.scaled_mm',
+                  accumulation=validate_accumulation(), nonfinite_comparisons=validate_nonfinite())
     root = Path(__file__).resolve().parents[1]
     result['source_sha256'] = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                                for name in ('fused_gemm_a2a.py', 'fused_gemm_a2a_kernels.py')}

@@ -104,13 +104,15 @@ scale per 32 elements and FP32 accumulation. Scales use
 Inf groups use NaN scales so overflow remains visible. Inputs and weights
 are requantized on each call, including CUDA Graph replay.
 
-Numerical validation uses the independent reference in
-[`benchmark/reference.py`](benchmark/reference.py): calculate scales in
-FP64, cast to E4M3, dequantize to FP32, then use ordinary PyTorch FP32 matmul
-with TF32 disabled. It checks forward, dgrad and wgrad; quantizer payload/scale
-bytes are also checked independently. **A direct comparison with a native
-PyTorch MXFP8 GEMM has not been run.** These checks validate the specified
-quantized math, not TE recipe parity or training accuracy relative to BF16.
+Numerical validation uses native PyTorch
+[`torch.nn.functional.scaled_mm`](https://docs.pytorch.org/docs/main/generated/torch.nn.functional.scaled_mm.html)
+with `BlockWise1x32` scaling, E8M0 scales in `SWIZZLE_32_4_4` layout and FP32
+output. The adapter in [`benchmark/reference.py`](benchmark/reference.py)
+compares forward, dgrad and wgrad using the same quantized operands as CuTe.
+Validation requires PyTorch with this API (tested with 2.12.0a0 in NGC 26.04
+on GB200); there is no dequantized matmul fallback.
+This checks GEMM and transport parity, not the shared quantizer's scale policy,
+TE recipe parity or training accuracy relative to BF16.
 
 MXFP8 requires `D=128` and BF16 master weights; TE quantized Parameter
 subclasses are not supported. Optional weight `main_grad` buffers must match
@@ -170,15 +172,15 @@ torchrun --standalone --nproc-per-node=4 benchmark/run.py \
 Add `--gate` for QKVG and `--profile` for Torch traces. For CP8/CP16, use
 multi-node torchrun on 2/4 four-GPU nodes with matching `--cp`.
 Use the same command with `--precision mxfp8` to measure MXFP8. The timed
-Async Ulysses reference stays BF16; fused numerical checks use independent
-MXFP8 math, including backward requantization and changed-input graph replay.
+Async Ulysses reference stays BF16; fused numerical checks use native PyTorch
+MXFP8 GEMMs, including backward requantization and changed-input graph replay.
 JSON retains the same timing fields and records each implementation's precision.
 MFU uses `--peak-tflops` (default 2500) for BF16 and `--mxfp8-peak-tflops`
 (default 5000) for MXFP8. These are projection measurements, not training MFU.
 
 CPU checks: `python -m unittest discover -s tests`.
 
-MXFP8 quantization, FP32 accumulation and distributed numerical regressions:
+MXFP8 native GEMM parity, FP32 accumulation and distributed regressions:
 
 ```bash
 python tests/mxfp8_local_driver.py --output results/mxfp8-local.json

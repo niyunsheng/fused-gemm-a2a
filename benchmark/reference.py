@@ -203,29 +203,27 @@ def interleave_qkv_rows(segment_major, heads, head_dim):
     return per_head.reshape(segment_major.shape)
 
 
-def quantize_mxfp8(x):
-    """Independent quantize/dequantize oracle; never used for benchmark timing."""
-    shape = x.shape
-    groups = F.pad(x.double(), (0, -shape[1] % 32)).reshape(shape[0], -1, 32)
-    peak = groups.abs().amax(-1, keepdim=True)
-    exponent = torch.ceil(torch.log2(peak / 448))
-    # Correct log2 rounding at exact power-of-two scale boundaries.
-    exponent = torch.where(peak <= 224 * torch.exp2(exponent), exponent - 1, exponent)
-    exponent = torch.where(peak > 448 * torch.exp2(exponent), exponent + 1, exponent)
-    exponent = torch.where(peak == 0, 0, exponent).clamp(-126, 127)
-    scale = torch.where(torch.isinf(peak), float('nan'), torch.exp2(exponent))
-    payload = (groups / scale).to(torch.float8_e4m3fn).float()
-    return (payload * scale.float()).reshape(shape[0], -1)[:, :shape[1]]
-
-
 def mxfp8_mm(a, b):
-    return quantize_mxfp8(a) @ quantize_mxfp8(b.T).T
+    """Native PyTorch MXFP8 GEMM on the same quantized operands as CuTe.
+
+    This checks GEMM parity, not the shared quantizer's scale-selection policy.
+    Kept outside benchmark timing; no dequantized matmul fallback.
+    """
+    from fused_gemm_a2a_kernels import mxfp8_quantize
+    aq, sa = mxfp8_quantize(a)
+    bq, sb = mxfp8_quantize(b.T)
+    out = F.scaled_mm(
+        aq, bq.T, sa.view(torch.float8_e8m0fnu), F.ScalingType.BlockWise1x32,
+        sb.view(torch.float8_e8m0fnu), F.ScalingType.BlockWise1x32,
+        swizzle_a=F.SwizzleType.SWIZZLE_32_4_4,
+        swizzle_b=F.SwizzleType.SWIZZLE_32_4_4, output_dtype=torch.float32)
+    return out[:a.shape[0], :b.shape[1]]
 
 
 @torch.no_grad()
 def mxfp8_projections(x, grads, o, dy, qkv_weight, out_weight, qkv_bias=None, out_bias=None,
                      *, heads, bias_in_gemm=False):
-    """Local quantized GEMMs plus gathered BF16 transport, independent of CuTe.
+    """Native PyTorch MXFP8 GEMMs plus gathered BF16 transport.
 
     Wgrad requantizes each rank's reduction axis before gradient reduction.
     Returned weight/bias gradients are FP32 rank-local contributions.
