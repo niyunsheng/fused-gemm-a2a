@@ -93,15 +93,24 @@ Parameter gradients are rank-local; the trainer handles CP/DP gradient reduction
 ### MXFP8
 
 Set `precision="mxfp8"` on `FusedGemmA2AWorkspace` to use native SM100
-block-scaled GEMMs for forward, dgrad and wgrad. Projection calls, master
-weights, activation interfaces and all-to-all transport remain BF16.
+block-scaled GEMMs for forward, dgrad and wgrad. Master weights and activation
+interfaces remain BF16. **Projection all-to-all (A2A) activation payloads are
+BF16 in both forward and backward.** Receive warps quantize arriving BF16
+blocks locally; FP8 payloads and E8M0 scales are not sent over A2A.
 
 Each GEMM independently quantizes its reduction axis to E4M3 with one E8M0
 scale per 32 elements and FP32 accumulation. Scales use
 `ceil(log2(amax / 448))`, clamped to [-126, 127]; zero groups use scale 1.
 Inf groups use NaN scales so overflow remains visible. Inputs and weights
-are requantized on each call, including CUDA Graph replay. This policy is
-validated against independent quantized math, not bitwise TE equivalence.
+are requantized on each call, including CUDA Graph replay.
+
+Numerical validation uses the independent reference in
+[`benchmark/reference.py`](benchmark/reference.py): calculate scales in
+FP64, cast to E4M3, dequantize to FP32, then use ordinary PyTorch FP32 matmul
+with TF32 disabled. It checks forward, dgrad and wgrad; quantizer payload/scale
+bytes are also checked independently. **A direct comparison with a native
+PyTorch MXFP8 GEMM has not been run.** These checks validate the specified
+quantized math, not TE recipe parity or training accuracy relative to BF16.
 
 MXFP8 requires `D=128` and BF16 master weights; TE quantized Parameter
 subclasses are not supported. Optional weight `main_grad` buffers must match
