@@ -11,6 +11,9 @@ remains the default. The production implementation is still two Python files.
   with one E8M0 power-of-two scale per 32 elements and FP32 accumulation.
 - Use `ceil(log2(amax / 448))`, clamped to [-126, 127]; zero groups use scale 1.
   This is a specified quantization policy, not a bitwise TE-recipe guarantee.
+- Groups containing Inf use the E8M0 NaN scale (byte 255), and NaN inputs
+  retain NaN payloads. Nonfinite inputs therefore remain observable through
+  native MMA rather than being silently saturated to finite gradients.
 - Quantize on each invocation, including graph replay after weight updates.
   Transposing an existing quantized representation does not implement a
   different reduction-axis quantization.
@@ -48,6 +51,10 @@ dW or separate `add_` launch. Each output tile has a unique writer; ordinary
 FP32 loads, addition and stores avoid atomic reduction and preserve subnormals.
 Loads and stores predicate padded M rows against the logical output boundary.
 The compilation cache distinguishes overwrite and accumulate specializations.
+The caller's `main_grad` must have the weight's exact shape and device,
+contiguous FP32 storage and a 16-byte-aligned pointer. Invalid buffers raise
+`ValueError` before launching wgrad; their shape must never determine a
+different GEMM output extent.
 
 For H4096 QKVG plus output projections, eliminating the temporary write and
 read removes `8 * (4 + 1) * H**2 = 640 MiB` of logical memory traffic per
@@ -56,6 +63,10 @@ backward call. This byte count is not a measured HBM bandwidth or speedup.
 Tests start from nonzero gradients, accumulate several changed-input graph
 replays, alternate overwrite and accumulation, protect output boundaries with
 canaries and exercise rectangular widths 128/384 and FP32 subnormals.
+Nonfinite regressions use tiny finite counterpart operands, so downstream
+overflow cannot hide incorrect finite saturation. They cover both standalone
+quantizer orientations, either wgrad operand, overwrite/accumulate, receive
+quantization, and changed-input CUDA Graph replay followed by finite recovery.
 
 ## Reproduce validation
 

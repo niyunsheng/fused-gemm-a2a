@@ -1198,11 +1198,12 @@ def _mx_scale_offset(row, group, groups: Constexpr):
 
 
 @cute.jit
-def _mx_scale_exponent(peak):
-    """ceil(log2(peak / 448)) for an exact finite BF16 magnitude.
+def _mx_scale(peak):
+    """E8M0 exponent and inverse scale for an exact BF16 magnitude.
 
     448 = 1.75 * 2**8. The exponent and significand comparison avoid SFU
     instructions. Clamping also handles BF16 subnormals; zero uses scale 1.
+    Inf groups use the E8M0 NaN encoding, preserving overflow through MMA.
     """
     exponent = cutlass.Int32(0)
     if peak > 0:
@@ -1211,7 +1212,11 @@ def _mx_scale_exponent(peak):
         if (bits & 0x7fffff) > 0x600000:
             exponent += 1
         exponent = cutlass.max(-126, cutlass.min(127, exponent))
-    return exponent
+    inv_scale = ((127 - exponent) << 23).bitcast(cutlass.Float32)
+    if peak == cutlass.Float32(float('inf')):
+        exponent = cutlass.Int32(128)  # E8M0 byte 255 is NaN.
+        inv_scale = cutlass.Float32(0)  # Inf * 0 also gives a NaN payload.
+    return exponent, inv_scale
 
 
 @cute.kernel
@@ -1270,8 +1275,7 @@ def _mx_quant_kernel(a: cute.Pointer, q: cute.Pointer, sf: cute.Pointer,
             values = fragment.load().to(cutlass.Float32)
         peak = cute.math.absf(values).reduce(cute.ReductionOp.MAX, cutlass.Float32(0), 0)
         peak = cute.arch.warp_reduction_max(peak, threads_in_group=4)
-        exponent = _mx_scale_exponent(peak)
-        inv_scale = ((127 - exponent) << 23).bitcast(cutlass.Float32)
+        exponent, inv_scale = _mx_scale(peak)
         quantized.store((values * inv_scale).to(cutlass.Float8E4M3FN))
         dst = cute.make_tensor(q + cute.assume(Int64(row) * kp + col, divby=8), cute.make_layout((8,), stride=(1,)))
         cute.copy(atom_out, quantized, dst)
@@ -1326,8 +1330,7 @@ def _mx_quantize_received(lane: Int32, program: Int32, worker: Int32,
                 values = fragments[i].load().to(cutlass.Float32)
                 peak = cute.math.absf(values).reduce(cute.ReductionOp.MAX, cutlass.Float32(0), 0)
                 peak = cute.arch.warp_reduction_max(peak, threads_in_group=4)
-                exponent = _mx_scale_exponent(peak)
-                inv_scale = ((127 - exponent) << 23).bitcast(cutlass.Float32)
+                exponent, inv_scale = _mx_scale(peak)
                 quantized = cute.make_rmem_tensor((8,), cutlass.Float8E4M3FN)
                 quantized.store((values * inv_scale).to(cutlass.Float8E4M3FN))
                 offset = cute.assume(Int64(row) * k + col, divby=8)

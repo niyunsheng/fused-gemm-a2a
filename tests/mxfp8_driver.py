@@ -238,6 +238,41 @@ def main():
                 and torch.equal(view.mx_scale, scales)), device=device)
         dist.all_reduce(valid, op=dist.ReduceOp.MIN)
         assert valid.item(), ('exhaustive BF16 receive quantization', sign)
+    # A nonfinite peer input must survive receive quantization. The small
+    # weight exposes Inf saturation that an ordinary-magnitude GEMM can hide
+    # by overflowing again. Replay also has to recover when inputs are finite.
+    with torch.no_grad():
+        projection.weight.fill_(2.0 ** -64)
+        inputs.fill_(1)
+        for _ in range(3):
+            projection(inputs, workspace)
+        graph = None
+        if not args.skip_graphs:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = projection(inputs, workspace)
+        nonfinite_cases = 0
+        for value in (float('inf'), -float('inf'), float('nan'), 1.0):
+            inputs[rank * local_rows, 0, 0] = value
+            eager = projection(inputs, workspace)
+            results = [eager]
+            if graph is not None:
+                graph.replay()
+                results.append(captured)
+            for result in results:
+                finite = torch.isfinite(result)
+                valid = finite.all() if value == 1.0 else (~finite[0]).all() & finite[1:].all()
+                valid = valid.to(torch.int32)
+                dist.all_reduce(valid, op=dist.ReduceOp.MIN)
+                assert valid.item(), ('nonfinite receive propagation', value)
+                nonfinite_cases += 1
+            payload, scales = kernels.mxfp8_quantize(view.recv, k_multiple=128)
+            valid = torch.tensor(int(torch.equal(view.mx_recv.view(torch.uint8), payload.view(torch.uint8))
+                                     and torch.equal(view.mx_scale, scales)), device=device)
+            dist.all_reduce(valid, op=dist.ReduceOp.MIN)
+            assert valid.item(), ('nonfinite receive bytes', value)
+        if graph is not None:
+            graph.reset()
     dy = torch.randn(128, h, device=device, dtype=torch.bfloat16)
     out = torch.empty(h, h, device=device, dtype=torch.float32)
     compiled = mxfp8_wgrad(dy, dy, out)
@@ -253,6 +288,7 @@ def main():
                                               native_block_scaled_mma=True,
                                               receive_quantization_byte_exact=True,
                                               exhaustive_bf16_scale_parity=True,
+                                              nonfinite_receive_comparisons=nonfinite_cases,
                                               source_sha256={name: hashlib.sha256(
                                                   (Path(__file__).resolve().parents[1] / name).read_bytes()).hexdigest()
                                                   for name in ('fused_gemm_a2a.py', 'fused_gemm_a2a_kernels.py')},

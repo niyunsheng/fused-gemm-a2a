@@ -194,7 +194,7 @@ CPU checks: `python -m unittest discover -s tests`.
 
 ### Experimental MXFP8 status
 
-The current implementation passes 678 independent quantized-reference
+Implementation `6b09fbf` passes 678 independent quantized-reference
 comparisons at each of CP3/CP8/CP16, 480 BF16 regression comparisons at
 each of CP8/CP16, exhaustive finite-BF16 byte parity, 76 exact FP32
 accumulation checks and 21 unit tests.
@@ -216,3 +216,16 @@ these percentages. This is a projection benchmark, not training MFU or
 convergence evidence. See [the paired results](docs/mxfp8.md#paired-performance-results-2026-10-22)
 for historical bias-mode timings, comparison against `85d1ecc`, source
 hashes and reproduction commands. MXFP8 remains opt-in.
+
+## License
+
+Original code is released under [MIT](LICENSE). This project builds on:
+
+- [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass): Blackwell GEMM examples,
+  [BSD-3-Clause](https://github.com/NVIDIA/cutlass/blob/main/LICENSE.txt).
+- [ByteDance VeOmni](https://github.com/ByteDance-Seed/VeOmni): async Ulysses
+  benchmark reference, [Apache-2.0](https://github.com/ByteDance-Seed/VeOmni/blob/main/LICENSE).
+
+The CuTe DSL runtime has separate
+[NVIDIA license terms](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html).
+Notices for adapted source are in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).

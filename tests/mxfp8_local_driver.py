@@ -116,6 +116,51 @@ def validate_accumulation():
     return dict(comparisons=cases, maximum_absolute_error=max(errors), fp32_subnormals=True)
 
 
+def validate_nonfinite():
+    """Overflow must remain observable, including after changed-input replay."""
+    cases = 0
+    for value in (float('inf'), -float('inf'), float('nan')):
+        for transpose in (False, True):
+            source = torch.ones(128, 128, device='cuda', dtype=torch.bfloat16)[:, :33]
+            source[0, 0] = source[1, 31] = source[2, 32] = value
+            if transpose:
+                source = source.T.contiguous().T
+            payload, scales = mxfp8_quantize(source)
+            assert torch.isnan(payload.float()[[0, 1, 2], [0, 31, 32]]).all()
+            if value == value:  # Inf groups must carry the E8M0 NaN scale.
+                assert torch.all(scales[torch.tensor([0, 16, 33], device='cuda')] == 255)
+            assert torch.isfinite(payload.float()[3:]).all()
+            cases += 1
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for operand in ('dy', 'x'):
+            for accumulate in (False, True):
+                dy = torch.ones(33, 128, device='cuda', dtype=torch.bfloat16)
+                x = torch.ones_like(dy)
+                (x if operand == 'dy' else dy).fill_(2.0 ** -64)
+                out = torch.ones(128, 128, device='cuda', dtype=torch.float32)
+                mxfp8_wgrad(dy, x, out, accumulate=accumulate)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    mxfp8_wgrad(dy, x, out, accumulate=accumulate)
+                for value in (float('inf'), -float('inf'), float('nan'), 1.0):
+                    target = dy if operand == 'dy' else x
+                    target[0, 0] = value
+                    out.fill_(1)
+                    graph.replay()
+                    affected = out[0, :] if operand == 'dy' else out[:, 0]
+                    if value == 1.0:
+                        assert torch.isfinite(out).all(), (operand, accumulate, 'finite recovery')
+                    else:
+                        assert (~torch.isfinite(affected)).all(), (operand, accumulate, value)
+                        assert torch.isfinite(out[1:, 1:]).all()
+                    cases += 1
+                graph.reset()
+    stream.synchronize()
+    return cases
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -123,7 +168,8 @@ def main():
     torch.cuda.set_device(0)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.manual_seed(123)
-    result = dict(quantizer_byte_comparisons=validate_quantization(), accumulation=validate_accumulation())
+    result = dict(quantizer_byte_comparisons=validate_quantization(), accumulation=validate_accumulation(),
+                  nonfinite_comparisons=validate_nonfinite())
     root = Path(__file__).resolve().parents[1]
     result['source_sha256'] = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                                for name in ('fused_gemm_a2a.py', 'fused_gemm_a2a_kernels.py')}

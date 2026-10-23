@@ -252,8 +252,12 @@ def _weight_grad(weight, a, b, precision="bf16"):
     _accumulated); otherwise return the BF16 gradient for autograd."""
     main_grad = getattr(weight, 'main_grad', None)
     if precision == 'mxfp8':
-        if main_grad is not None and (main_grad.dtype != torch.float32 or not main_grad.is_contiguous()):
-            raise ValueError('MXFP8 accumulation requires contiguous FP32 main_grad')
+        if main_grad is not None and (
+                main_grad.shape != weight.shape or main_grad.device != weight.device
+                or main_grad.dtype != torch.float32 or not main_grad.is_contiguous()
+                or main_grad.data_ptr() % 16):
+            raise ValueError('MXFP8 main_grad must match the weight shape and device, '
+                             'with contiguous FP32 storage and 16-byte alignment')
         out = torch.empty_like(weight) if main_grad is None else main_grad
         mxfp8_wgrad(a, b, out, accumulate=main_grad is not None)
         return out if main_grad is None else _accumulated(weight)
