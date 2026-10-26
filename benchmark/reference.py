@@ -201,3 +201,56 @@ def interleave_qkv_rows(segment_major, heads, head_dim):
     shape = segment_major.shape[1:]
     per_head = segment_major.reshape((segments, heads, head_dim) + shape).transpose(0, 1)
     return per_head.reshape(segment_major.shape)
+
+
+def mxfp8_mm(a, b):
+    """Native PyTorch MXFP8 GEMM on the same quantized operands as CuTe.
+
+    This checks GEMM parity, not the shared quantizer's scale-selection policy.
+    Kept outside benchmark timing; no dequantized matmul fallback.
+    """
+    from fused_gemm_a2a_kernels import mxfp8_quantize
+    aq, sa = mxfp8_quantize(a)
+    bq, sb = mxfp8_quantize(b.T)
+    out = F.scaled_mm(
+        aq, bq.T, sa.view(torch.float8_e8m0fnu), F.ScalingType.BlockWise1x32,
+        sb.view(torch.float8_e8m0fnu), F.ScalingType.BlockWise1x32,
+        swizzle_a=F.SwizzleType.SWIZZLE_32_4_4,
+        swizzle_b=F.SwizzleType.SWIZZLE_32_4_4, output_dtype=torch.float32)
+    return out[:a.shape[0], :b.shape[1]]
+
+
+@torch.no_grad()
+def mxfp8_projections(x, grads, o, dy, qkv_weight, out_weight, qkv_bias=None, out_bias=None,
+                     *, heads, bias_in_gemm=False):
+    """Native PyTorch MXFP8 GEMMs plus gathered BF16 transport.
+
+    Wgrad requantizes each rank's reduction axis before gradient reduction.
+    Returned weight/bias gradients are FP32 rank-local contributions.
+    """
+    p, rank = dist.get_world_size(), dist.get_rank()
+    m, h = x.shape
+    d, segments = h // heads, len(grads)
+    head_slice = slice(rank * (heads // p), (rank + 1) * (heads // p))
+    rows = slice(rank * m, (rank + 1) * m)
+
+    def gather(tensor, dim):
+        parts = [torch.empty_like(tensor) for _ in range(p)]
+        dist.all_gather(parts, tensor.contiguous())
+        return torch.cat(parts, dim=dim)
+
+    raw = mxfp8_mm(x, qkv_weight.T)
+    if qkv_bias is not None:
+        raw = (raw if bias_in_gemm else raw.to(x.dtype).float()) + qkv_bias.float()
+    packed = gather(raw.to(x.dtype), 0).view(p * m, heads, segments, d)
+    qs = tuple(packed[:, head_slice, s].contiguous() for s in range(segments))
+    grad = gather(torch.stack(grads, dim=2), 1).reshape(p * m, segments * h)[rows]
+    dx, dwq = mxfp8_mm(grad, qkv_weight).to(x.dtype), mxfp8_mm(grad.T, x)
+    oseq = gather(o, 1).flatten(1)[rows]
+    y = mxfp8_mm(oseq, out_weight.T).to(o.dtype)
+    if out_bias is not None:
+        y = y + out_bias
+    full_do = gather(mxfp8_mm(dy, out_weight).to(o.dtype), 0).view(p * m, heads, d)
+    return dict(qkv=qs, dx=dx, dwq=dwq, dbq=grad.float().sum(0), y=y,
+                do=full_do[:, head_slice].contiguous(), dwo=mxfp8_mm(dy.T, oseq),
+                dbo=dy.float().sum(0))

@@ -2,10 +2,15 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fused_gemm_a2a_kernels import CTA_M, push_split, tile_swizzle, validate_peer_count, validate_tile_n  # noqa: E402
+import torch
+import fused_gemm_a2a as fused
+
+from fused_gemm_a2a_kernels import (CTA_M, mxfp8_tile_n, push_split, tile_swizzle,
+                                  validate_peer_count, validate_tile_n)  # noqa: E402
 
 
 class RecvPlanTest(unittest.TestCase):
@@ -29,6 +34,20 @@ class RecvPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r'CP \* tile N'):
             validate_tile_n('push', 256, 4096, 32, 4096)
         validate_tile_n('push', 128, 4096, 32, 4096)
+
+    def test_mxfp8_tile_selection_preserves_supported_widths(self):
+        for peers in (1, 2, 4, 8, 16, 32):
+            for heads_per_peer in (1, 2, 3, 4):
+                hidden = peers * heads_per_peer * 128
+                for segments in (1, 3, 4):
+                    tile = mxfp8_tile_n('push', hidden * segments, peers, segments)
+                    validate_tile_n('push', tile, hidden * segments, peers, hidden, segments, 128)
+                tile = mxfp8_tile_n('recv', hidden, peers)
+                validate_tile_n('recv', tile, hidden, peers)
+                self.assertEqual(hidden % mxfp8_tile_n('local', hidden), 0)
+        self.assertEqual(mxfp8_tile_n('push', 4096, 16), 256)
+        self.assertEqual(mxfp8_tile_n('push', 4096, 32), 128)
+        self.assertEqual(mxfp8_tile_n('local', 384), 128)
 
     def test_output_tiles_must_cover_exact_width(self):
         for width in (4095, 4097):
@@ -70,6 +89,38 @@ class RecvPlanTest(unittest.TestCase):
         for args in ((4096, 0, 1), (4000, 16, 1), (32 * 16, 16, 1)):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 push_split(*args)
+
+
+class MXFP8MainGradTest(unittest.TestCase):
+    def setUp(self):
+        self.weight = torch.nn.Parameter(torch.empty(384, 128, dtype=torch.bfloat16))
+        self.dy = torch.empty(33, 384, dtype=torch.bfloat16)
+        self.x = torch.empty(33, 128, dtype=torch.bfloat16)
+
+    def reject(self, buffer):
+        self.weight.main_grad = buffer
+        with patch.object(fused, 'mxfp8_wgrad') as gemm:
+            with self.assertRaisesRegex(ValueError, 'main_grad'):
+                fused._weight_grad(self.weight, self.dy, self.x, 'mxfp8')
+            gemm.assert_not_called()
+
+    def test_wrong_shape_cannot_silently_truncate_wgrad(self):
+        for shape in ((128, 128), (384, 256), (384 * 128,)):
+            with self.subTest(shape=shape):
+                self.reject(torch.empty(shape, dtype=torch.float32))
+
+    def test_wrong_device_is_rejected(self):
+        self.reject(torch.empty(self.weight.shape, device='meta', dtype=torch.float32))
+
+    def test_misaligned_contiguous_view_is_rejected(self):
+        buffer = torch.empty(self.weight.numel() + 1, dtype=torch.float32)[1:].view(self.weight.shape)
+        self.assertTrue(buffer.is_contiguous())
+        self.assertNotEqual(buffer.data_ptr() % 16, 0)
+        self.reject(buffer)
+
+    def test_dtype_and_strides_are_checked(self):
+        self.reject(torch.empty_like(self.weight))
+        self.reject(torch.empty(128, 384, dtype=torch.float32).T)
 
 
 if __name__ == '__main__':

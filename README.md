@@ -1,7 +1,8 @@
 # Fused GEMM + All-to-All
 
 Fused projection GEMMs and Ulysses all-to-all, with backward, for BF16 MHA
-training on NVLink-connected GB200 (SM100) GPUs.
+training on NVLink-connected GB200 (SM100) GPUs. MXFP8 GEMMs are opt-in;
+BF16 remains the default.
 **GQA is not supported yet.**
 
 ## How it works
@@ -48,7 +49,7 @@ Import from the checkout, or copy these two files into your project.
 | File | Purpose |
 | --- | --- |
 | `fused_gemm_a2a.py` | Public workspace, projections and autograd |
-| `fused_gemm_a2a_kernels.py` | CuTe GEMMs, peer transport, Triton copies/reductions and tile geometry |
+| `fused_gemm_a2a_kernels.py` | CuTe GEMMs, peer transport, quantization, copies/reductions and tile geometry |
 
 ## API
 
@@ -88,6 +89,35 @@ y.backward(grad_y)
 ```
 
 Parameter gradients are rank-local; the trainer handles CP/DP gradient reduction.
+
+### MXFP8
+
+Set `precision="mxfp8"` on `FusedGemmA2AWorkspace` to use native SM100
+block-scaled GEMMs for forward, dgrad and wgrad. Master weights and activation
+interfaces remain BF16. **Projection all-to-all (A2A) activation payloads are
+BF16 in both forward and backward.** Receive warps quantize arriving BF16
+blocks locally; FP8 payloads and E8M0 scales are not sent over A2A.
+
+Each GEMM independently quantizes its reduction axis to E4M3 with one E8M0
+scale per 32 elements and FP32 accumulation. Scales use
+`ceil(log2(amax / 448))`, clamped to [-126, 127]; zero groups use scale 1.
+Inf groups use NaN scales so overflow remains visible. Inputs and weights
+are requantized on each call, including CUDA Graph replay.
+
+Numerical validation uses native PyTorch
+[`torch.nn.functional.scaled_mm`](https://docs.pytorch.org/docs/main/generated/torch.nn.functional.scaled_mm.html)
+with `BlockWise1x32` scaling, E8M0 scales in `SWIZZLE_32_4_4` layout and FP32
+output. The adapter in [`benchmark/reference.py`](benchmark/reference.py)
+compares forward, dgrad and wgrad using the same quantized operands as CuTe.
+Validation requires PyTorch with this API (tested with 2.12.0a0 in NGC 26.04
+on GB200); there is no dequantized matmul fallback.
+This checks GEMM and transport parity, not the shared quantizer's scale policy,
+TE recipe parity or training accuracy relative to BF16.
+
+MXFP8 requires `D=128` and BF16 master weights; TE quantized Parameter
+subclasses are not supported. Optional weight `main_grad` buffers must match
+the weight shape/device, use contiguous FP32 storage and be 16-byte aligned.
+Wgrad accumulates directly into these buffers.
 
 ## Execution constraints
 
@@ -141,7 +171,22 @@ torchrun --standalone --nproc-per-node=4 benchmark/run.py \
 
 Add `--gate` for QKVG and `--profile` for Torch traces. For CP8/CP16, use
 multi-node torchrun on 2/4 four-GPU nodes with matching `--cp`.
+Use the same command with `--precision mxfp8` to measure MXFP8. The timed
+Async Ulysses reference stays BF16; fused numerical checks use native PyTorch
+MXFP8 GEMMs, including backward requantization and changed-input graph replay.
+JSON retains the same timing fields and records each implementation's precision.
+MFU uses `--peak-tflops` (default 2500) for BF16 and `--mxfp8-peak-tflops`
+(default 5000) for MXFP8. These are projection measurements, not training MFU.
+
 CPU checks: `python -m unittest discover -s tests`.
+
+MXFP8 native GEMM parity, FP32 accumulation and distributed regressions:
+
+```bash
+python tests/mxfp8_local_driver.py --output results/mxfp8-local.json
+torchrun --standalone --nproc-per-node=4 tests/mxfp8_driver.py \
+  --lengths 1 33 1153 --output results/mxfp8-parity.json
+```
 
 ## License
 

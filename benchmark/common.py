@@ -26,6 +26,7 @@ class BenchmarkRuntime:
         self.device = torch.device('cuda', int(os.environ['LOCAL_RANK']))
         torch.cuda.set_device(self.device)
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_tf32 = False
         dist.init_process_group('nccl', device_id=self.device, timeout=timedelta(minutes=5))
         self.capture_stream = None
         if args.cuda_graphs:
